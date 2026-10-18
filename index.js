@@ -93,14 +93,35 @@ export async function writeEnabled(enabled) {
   return { changed: true, backup: bak };
 }
 
-function restartApp() {
+async function restartApp() {
   const exe = exePath();
   if (!existsSync(exe)) throw new Error('找不到应用可执行文件：' + exe);
-  const command =
-    'timeout /t 2 /nobreak >nul & taskkill /f /im "DeepSeek Harness.exe" >nul 2>nul & start "" "' + exe + '"';
-  const child = spawn('cmd.exe', ['/c', command], { detached: true, stdio: 'ignore', windowsHide: true });
-  child.unref();
-  return { exe };
+
+  // 用 VBS 以窗口样式 0 执行：计划任务拉起 wscript，cmd 全程隐藏；
+  // 任务本身不受 DSH 进程树（Job Object）影响，主进程被杀也不会连坐。
+  const vbs = path.join(os.tmpdir(), 'dsh-lqconfig-restart.vbs');
+  const lines = [
+    'Set sh = CreateObject("WScript.Shell")',
+    'sh.Run "cmd /c timeout /t 2 /nobreak >nul & taskkill /f /im ""DeepSeek Harness.exe"" >nul 2>nul & start """" ""' +
+      exe +
+      '""", 0, False',
+    '',
+  ];
+  await fs.writeFile(vbs, lines.join('\r\n'), 'utf8');
+
+  const task = 'dsh-lqconfig-restart';
+  const { execFile } = await import('node:child_process');
+  const run = (args) =>
+    new Promise((resolve, reject) => {
+      execFile('schtasks', args, { windowsHide: true }, (error, stdout, stderr) => {
+        if (error) reject(new Error((stderr || stdout || error.message).trim()));
+        else resolve((stdout || '').trim());
+      });
+    });
+
+  await run(['/create', '/f', '/tn', task, '/tr', 'wscript.exe //B ' + vbs, '/sc', 'once', '/st', '23:59']);
+  await run(['/run', '/tn', task]);
+  return { exe, task, vbs };
 }
 
 function sendJson(res, status, obj) {
@@ -141,7 +162,7 @@ export function apply(ctx) {
               return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
             }
             if (req.method === 'POST' && route === '/api/restart') {
-              return sendJson(res, 200, { ok: true, ...restartApp() });
+              return sendJson(res, 200, { ok: true, ...(await restartApp()) });
             }
             return sendJson(res, 404, { ok: false, error: 'not found' });
           } catch (error) {
