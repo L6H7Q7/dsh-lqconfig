@@ -158,9 +158,34 @@ window.__ModuleLoader__.load({
         } });
       }
     }
+    function dismissNativeNotice(id) {
+      if (nativeDisposed || nativeSnapshot.notice?.id !== id) return;
+      ++nativeNoticeSequence;
+      publishNative({ notice: null });
+    }
     function NativeOpenNotice() {
       const state = useNativeState();
       const notice = state.notice;
+      const [remaining, setRemaining] = useState(10);
+      useEffect(() => {
+        setRemaining(10);
+        if (!notice || notice.busy) return;
+        const id = notice.id;
+        const deadline = Date.now() + 10000;
+        const timer = setInterval(() => {
+          if (nativeDisposed || nativeSnapshot.notice?.id !== id || nativeSnapshot.notice.busy) {
+            clearInterval(timer);
+            return;
+          }
+          const seconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+          setRemaining(seconds);
+          if (seconds === 0) {
+            clearInterval(timer);
+            dismissNativeNotice(id);
+          }
+        }, 1000);
+        return () => clearInterval(timer);
+      }, [notice?.id, notice?.busy]);
       if (!notice) return null;
       return el('div', { role: 'alert', style: {
         position: 'fixed', right: 20, bottom: 24, zIndex: 10000, maxWidth: 430,
@@ -180,8 +205,8 @@ window.__ModuleLoader__.load({
             onClick: () => { void requestNativeOpen(notice.path, notice.id); },
           }, notice.busy ? '请求中…' : '仅重试系统打开') : null,
           el('button', { type: 'button', style: S.btn, onClick: () => {
-            ++nativeNoticeSequence; publishNative({ notice: null });
-          } }, '关闭')));
+            dismissNativeNotice(notice.id);
+          } }, notice.busy ? '关闭' : '关闭（' + remaining + 's）')));
     }
     function installNativeOpening(ctx) {
       nativeDisposed = false;
