@@ -15,7 +15,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const name = 'dsh-lqconfig';
 export const inject = ['webServer'];
@@ -146,7 +146,7 @@ function launchNativePath(target) {
       error.code = 'native-timeout';
       error.submitted = null;
       finish(error);
-    }, 20000);
+    }, 3000);
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(-16384); });
@@ -175,28 +175,85 @@ function launchNativePath(target) {
   });
 }
 
+function explorerTarget(windowsPath) {
+  // Match dsh-native-command: preserve URI escaping and disambiguate the
+  // comma/equals characters used by Explorer's own argument grammar.
+  return pathToFileURL(windowsPath, { windows: true }).href
+    .replace(/(?:%[89A-F][0-9A-F])+/gi, escaped => decodeURIComponent(escaped))
+    .replaceAll(',', '%2C').replaceAll('=', '%3D');
+}
+
 function revealNativeLocation(target, directory, select) {
   const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'explorer.exe');
-  // An argv element, not a shell command. Node quotes spaces and trailing
-  // separators; validation already rejects embedded quotes and control bytes.
-  const args = select ? ['/select,' + target] : [directory];
+  const fallbackPath = select ? target : directory;
+  const uri = explorerTarget(fallbackPath);
+  const args = select ? ['/select,', uri] : [uri];
   return new Promise((resolve, reject) => {
-    const child = spawn(executable, args, {
-      shell: false, windowsHide: true, detached: true, stdio: 'ignore',
-    });
-    child.once('error', reject);
-    child.once('spawn', () => {
-      child.unref();
-      // A successful launch acknowledges the reveal request, not visibility
-      // of an Explorer window. Existing Explorer instances may handle it.
-      resolve({ fallback: 'revealed', fallbackPath: select ? target : directory, fallbackDisplayed: null });
+    let child, timer, settled = false, spawned = false, stderr = '';
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        error.fallbackPath = fallbackPath;
+        error.fallbackSubmitted = spawned;
+        error.fallback ||= spawned ? 'unconfirmed' : null;
+        error.stderr = stderr.trim();
+        reject(error);
+      } else resolve(result);
+    };
+    // This is a separate acknowledgement budget, after the 3-second native
+    // opener budget. It never measures or claims Explorer-window visibility.
+    timer = setTimeout(() => {
+      const error = new Error(spawned
+        ? '定位进程未在 3 秒内返回委托结果；窗口是否出现未知，未终止资源管理器'
+        : '定位进程未在 3 秒内确认启动；结果未知');
+      error.code = spawned ? 'reveal-confirm-timeout' : 'reveal-start-timeout';
+      error.fallback = 'unconfirmed';
+      error.exitCode = null;
+      // Stop retaining this waiter and its pipes, not the GUI process.
+      child?.unref();
+      child?.stdout?.destroy();
+      child?.stderr?.destroy();
+      finish(error);
+    }, 3000);
+    try {
+      child = spawn(executable, args, {
+        shell: false, windowsHide: false, detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) { finish(error); return; }
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.resume();
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-16384); });
+    child.once('spawn', () => { spawned = true; });
+    child.once('error', error => { finish(error); });
+    child.once('close', (exitCode, signal) => {
+      if (settled) return;
+      if (exitCode === 0 || exitCode === 1) {
+        finish(null, {
+          fallback: 'delegated', fallbackSubmitted: true,
+          fallbackPath, fallbackDisplayed: null,
+          fallbackExitCode: exitCode, fallbackStderr: stderr.trim(),
+        });
+        return;
+      }
+      const error = new Error('定位进程未完成委托' + (stderr.trim() ? '：' + stderr.trim() : ''));
+      error.code = 'reveal-exit-failed';
+      error.exitCode = exitCode;
+      error.signal = signal;
+      // A completed non-handoff exit is a known failure, not an unknown wait.
+      error.fallback = 'failed';
+      finish(error);
     });
   });
 }
 
+
 async function fallbackNativeLocation(target, originalStat, targetMissing) {
   let current = originalStat;
-  // Opening may have taken 20 seconds; recheck if the file moved meanwhile.
+  // Recheck after the native opener wait in case the file moved meanwhile.
   if (!targetMissing) {
     try { current = await fs.stat(target); }
     catch (error) {
@@ -243,8 +300,13 @@ export async function openNativePath(value) {
       Object.assign(error, await fallbackNativeLocation(target, stat,
         stat === undefined && (error.code === 'ENOENT' || error.code === 'ENOTDIR')));
     } catch (fallbackError) {
-      error.fallback = null;
-      error.fallbackError = { code: fallbackError.code || 'reveal-failed', message: fallbackError.message };
+      error.fallback = fallbackError.fallback || null;
+      error.fallbackPath = fallbackError.fallbackPath || null;
+      error.fallbackSubmitted = fallbackError.fallbackSubmitted ?? false;
+      error.fallbackError = {
+        code: fallbackError.code || 'reveal-failed', message: fallbackError.message,
+        exitCode: fallbackError.exitCode ?? null, stderr: fallbackError.stderr || '',
+      };
     }
     throw error;
   }
@@ -430,6 +492,9 @@ export function apply(ctx) {
                 fallback: error.fallback || null,
                 fallbackPath: error.fallbackPath || null,
                 fallbackDisplayed: null,
+                fallbackSubmitted: error.fallbackSubmitted ?? false,
+                fallbackExitCode: error.fallbackExitCode ?? null,
+                fallbackStderr: error.fallbackStderr || '',
                 fallbackError: error.fallbackError || null,
               });
             }

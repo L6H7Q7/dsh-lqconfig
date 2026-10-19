@@ -91,6 +91,7 @@ window.__ModuleLoader__.load({
         error.code = detail?.code ?? data.code;
         error.submitted = data.submitted;
         error.fallback = data.fallback;
+        error.fallbackPath = data.fallbackPath;
         error.fallbackError = data.fallbackError;
         throw error;
       }
@@ -147,12 +148,13 @@ window.__ModuleLoader__.load({
       } catch (error) {
         if (!nativeDisposed && id === nativeNoticeSequence) publishNative({ notice: {
           id, path: target, busy: false,
-          message: error.fallback === 'revealed'
-            ? '文件未能用系统程序打开，已为你打开所在文件夹' : error.message,
-          detail: error.fallback === 'revealed' ? error.message : '',
+          message: error.fallback === 'delegated' || error.fallback === 'revealed'
+            ? '文件未能用系统程序打开，已请求打开所在文件夹' : error.message,
+          detail: error.fallback === 'delegated' || error.fallback === 'revealed' ? error.message : '',
+          fallbackPath: error.fallbackPath,
           code: error.code,
           fallbackError: error.fallbackError,
-          unknown: error.submitted === null,
+          unknown: error.submitted === null || error.fallback === 'unconfirmed',
         } });
       }
     }
@@ -169,7 +171,8 @@ window.__ModuleLoader__.load({
         el('div', { style: { marginTop: 8, whiteSpace: 'pre-wrap' } }, notice.message),
         notice.detail ? el('div', { style: { marginTop: 6, opacity: .8 } }, '原始原因：' + notice.detail) : null,
         notice.code !== undefined ? el('div', { style: { marginTop: 6, opacity: .8 } }, '错误码：' + notice.code) : null,
-        notice.fallbackError ? el('div', { style: { marginTop: 6, opacity: .8 } }, '打开所在位置也未完成：' + notice.fallbackError.message) : null,
+        notice.fallbackError ? el('div', { style: { marginTop: 6, opacity: .8 } }, '定位请求：' + notice.fallbackError.message + '（' + notice.fallbackError.code + '）') : null,
+        notice.fallbackPath ? el('div', { style: { marginTop: 6, wordBreak: 'break-all', opacity: .8 } }, '请求定位：' + notice.fallbackPath) : null,
         el('div', { style: { marginTop: 6, wordBreak: 'break-all', opacity: .75 } }, notice.path),
         el('div', { style: { marginTop: 8, opacity: .75 } }, 'Sidebar 原有预览不受影响。'),
         el('div', { style: { display: 'flex', gap: 8, marginTop: 12 } },
