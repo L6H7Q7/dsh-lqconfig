@@ -1,7 +1,7 @@
 /**
  * dsh-lqconfig —— 个人配置插件（浏览器半侧）
  *
- * 设置里的「LQ配置」分区：滑块控件，改动即时保存，保存后提示「暂不重启 / 立即重启」。
+ * 设置里的「LQ配置」分区；系统打开开关独立即时生效，不触发重启。
  */
 window.__ModuleLoader__.load({
   id: 'dsh-lqconfig',
@@ -64,7 +64,173 @@ window.__ModuleLoader__.load({
         el('span', { style: { position: 'absolute', top: 3, left: checked ? 23 : 3, width: 18, height: 18, borderRadius: 9, background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,.25)', transition: 'left .2s' } }));
     }
 
+    // Plugin-lifetime state: closing the settings page does not turn this off.
+    let nativeSnapshot = { openNative: false, saving: false, message: '', error: '', compatibility: '', notice: null };
+    const nativeSubscribers = new Set();
+    let nativeDisposed = true;
+    let nativeRevision = 0;
+    const publishNative = patch => {
+      if (nativeDisposed) return;
+      nativeSnapshot = { ...nativeSnapshot, ...patch };
+      for (const listener of [...nativeSubscribers]) listener();
+    };
+    function useNativeState() {
+      return React.useSyncExternalStore(
+        React.useCallback(listener => { nativeSubscribers.add(listener); return () => nativeSubscribers.delete(listener); }, []),
+        () => nativeSnapshot,
+      );
+    }
+    async function nativeJson(route, body) {
+      const response = await fetch(API + route, body === undefined ? { cache: 'no-store' } : {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.ok) {
+        const detail = data.error && typeof data.error === 'object' ? data.error : null;
+        const error = new Error(detail?.message || data.error || '请求失败（HTTP ' + response.status + '）');
+        error.code = detail?.code ?? data.code;
+        error.submitted = data.submitted;
+        error.fallback = data.fallback;
+        error.fallbackError = data.fallbackError;
+        throw error;
+      }
+      return data;
+    }
+    async function loadNativeSettings() {
+      const revision = ++nativeRevision;
+      try {
+        const data = await nativeJson('/state');
+        if (revision === nativeRevision) publishNative({ openNative: data.openNative === true, error: '' });
+      } catch (error) {
+        if (revision === nativeRevision) publishNative({ openNative: false, error: '读取系统打开设置失败：' + error.message });
+      }
+    }
+    async function saveNativeSettings(enabled) {
+      const revision = ++nativeRevision;
+      // Disable immediately; enable only after the Host has saved the setting.
+      publishNative({ saving: true, ...(enabled ? {} : { openNative: false }), message: '', error: '' });
+      try {
+        const data = await nativeJson('/native-setting', { enabled });
+        if (revision === nativeRevision) publishNative({ openNative: data.openNative === true, saving: false, message: '已保存，即时生效，无需重启。' });
+      } catch (error) {
+        // Fail closed; an unsaved toggle must never silently activate opening.
+        if (revision === nativeRevision) publishNative({ openNative: false, saving: false, error: '保存失败：' + error.message });
+      }
+    }
+    function nativePathOf(value, options) {
+      if (typeof value !== 'string' || options?.line !== undefined || /#L\d+(?:-L?\d+)?$/iu.test(value)) return null;
+      let target = value;
+      if (/^file:/iu.test(value)) {
+        let url;
+        try { url = new URL(value); } catch { return null; }
+        if (url.protocol !== 'file:' || url.search || url.hash || url.username || url.password) return null;
+        try { target = decodeURIComponent(url.pathname); } catch { return null; }
+        if (url.hostname && url.hostname !== 'localhost') target = '\\\\' + url.hostname + target.replace(/\//g, '\\');
+        else target = target.replace(/^\/([A-Za-z]:[\\/])/u, '$1');
+      }
+      if (/[\x00-\x1f\x7f"<>|*?]/u.test(target) || /#L\d+(?:-L?\d+)?$/iu.test(target)) return null;
+      if (/^(?:\\\\|\/\/)\.[\\/]/u.test(target)) return null;
+      return /^[A-Za-z]:[\\/]/u.test(target) || /^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/u.test(target) ? target : null;
+    }
+    let nativeNoticeSequence = 0;
+    async function requestNativeOpen(target, retryId) {
+      if (nativeDisposed || !nativeSnapshot.openNative) return;
+      const id = ++nativeNoticeSequence;
+      if (retryId !== undefined && nativeSnapshot.notice?.id === retryId) {
+        publishNative({ notice: { ...nativeSnapshot.notice, id, busy: true } });
+      }
+      try {
+        await nativeJson('/native-open', { path: target });
+        if (!nativeDisposed && id === nativeNoticeSequence) {
+          publishNative({ message: '系统已接受打开请求；文件是否显示尚未核实。', notice: null });
+        }
+      } catch (error) {
+        if (!nativeDisposed && id === nativeNoticeSequence) publishNative({ notice: {
+          id, path: target, busy: false,
+          message: error.fallback === 'revealed'
+            ? '文件未能用系统程序打开，已为你打开所在文件夹' : error.message,
+          detail: error.fallback === 'revealed' ? error.message : '',
+          code: error.code,
+          fallbackError: error.fallbackError,
+          unknown: error.submitted === null,
+        } });
+      }
+    }
+    function NativeOpenNotice() {
+      const state = useNativeState();
+      const notice = state.notice;
+      if (!notice) return null;
+      return el('div', { role: 'alert', style: {
+        position: 'fixed', right: 20, bottom: 24, zIndex: 10000, maxWidth: 430,
+        background: 'var(--dsw-alias-background-primary, #fff)', color: 'var(--dsw-alias-label-primary, #222)',
+        border: '1px solid #c28b30', borderRadius: 10, padding: 16, boxShadow: '0 4px 24px #0003', fontSize: 14,
+      } },
+        el('strong', null, notice.unknown ? '系统打开结果无法确认' : '系统打开未完成'),
+        el('div', { style: { marginTop: 8, whiteSpace: 'pre-wrap' } }, notice.message),
+        notice.detail ? el('div', { style: { marginTop: 6, opacity: .8 } }, '原始原因：' + notice.detail) : null,
+        notice.code !== undefined ? el('div', { style: { marginTop: 6, opacity: .8 } }, '错误码：' + notice.code) : null,
+        notice.fallbackError ? el('div', { style: { marginTop: 6, opacity: .8 } }, '打开所在位置也未完成：' + notice.fallbackError.message) : null,
+        el('div', { style: { marginTop: 6, wordBreak: 'break-all', opacity: .75 } }, notice.path),
+        el('div', { style: { marginTop: 8, opacity: .75 } }, 'Sidebar 原有预览不受影响。'),
+        el('div', { style: { display: 'flex', gap: 8, marginTop: 12 } },
+          state.openNative ? el('button', { type: 'button', style: S.btn, disabled: notice.busy,
+            onClick: () => { void requestNativeOpen(notice.path, notice.id); },
+          }, notice.busy ? '请求中…' : '仅重试系统打开') : null,
+          el('button', { type: 'button', style: S.btn, onClick: () => {
+            ++nativeNoticeSequence; publishNative({ notice: null });
+          } }, '关闭')));
+    }
+    function installNativeOpening(ctx) {
+      nativeDisposed = false;
+      publishNative({ openNative: false, saving: false, message: '', error: '', notice: null });
+      const wrappers = new Map();
+      // Current DSH exposes the original registration through entries(). Keep
+      // its children, stores and renderer authorization intact; wrap only Comp.
+      // This is version-dependent: unknown ChatView shapes fail closed.
+      function reconcile() {
+        const entries = ctx.slots.entries('conversation.view');
+        for (const [entry, record] of wrappers) {
+          if (entries.includes(entry)) continue;
+          if (entry.component === record.wrapper) entry.component = record.original;
+          wrappers.delete(entry);
+        }
+        for (const entry of entries) {
+          if (entry.options?.id !== 'chat' || wrappers.has(entry)) continue;
+          const Original = entry.component;
+          if (typeof Original !== 'function' || Original.name !== 'ChatView') continue;
+          function NativeOpenChat(props) {
+            const openFile = React.useCallback(async (target, options) => {
+              const result = await props.openFile(target, options);
+              const nativePath = nativePathOf(target, options);
+              if (!nativeDisposed && nativeSnapshot.openNative && nativePath !== null) void requestNativeOpen(nativePath);
+              return result;
+            }, [props.openFile]);
+            return el(Original, { ...props, openFile });
+          }
+          entry.component = NativeOpenChat;
+          wrappers.set(entry, { original: Original, wrapper: NativeOpenChat });
+        }
+        const compatibility = wrappers.size ? '' : '当前聊天组件未匹配，系统双开未接入；请复核 DSH 版本。';
+        if (compatibility !== nativeSnapshot.compatibility) publishNative({ compatibility });
+      }
+      const unsubscribe = ctx.slots.subscribe('conversation.view', reconcile);
+      reconcile();
+      void loadNativeSettings();
+      return () => {
+        nativeDisposed = true;
+        ++nativeRevision;
+        ++nativeNoticeSequence;
+        unsubscribe();
+        for (const [entry, record] of wrappers) {
+          if (entry.component === record.wrapper) entry.component = record.original;
+        }
+        wrappers.clear();
+      };
+    }
+
+
     function LqSection() {
+      const native = useNativeState();
       const [patchPath, setPatchPath] = useState('');
       const [hidden, setHidden] = useState(false);
       const [saving, setSaving] = useState(false);
@@ -194,11 +360,25 @@ window.__ModuleLoader__.load({
           el('div', { style: S.status }, '当前：' + (chainZh ? '已开启' : '未开启') + (chainSaving ? ' · 处理中…' : '')),
           chainMessage ? el('div', { style: chainTone === 'warn' ? S.warn : chainTone === 'ok' ? S.ok : S.note }, chainMessage) : null),
         el('div', { style: S.card },
+          el('div', { style: S.head },
+            el('div', { style: S.title }, '系统软件打开路径/程序'),
+            el(Switch, { checked: native.openNative, disabled: native.saving, label: '系统软件打开路径/程序',
+              onChange: event => { void saveNativeSettings(event.target.checked); } })),
+          el('div', { style: S.desc }, '开启后，点击聊天里的本地绝对路径链接，会保留 Sidebar 原有预览，并用系统默认软件打开文件或目录。系统打开失败时尝试打开所在位置；行号链接、相对路径和网页链接保持原有行为。'),
+          el('div', { style: S.status }, '当前：' + (native.openNative ? '已开启' : '未开启') + (native.saving ? ' · 保存中…' : '') + ' · 保存即时生效'),
+          native.message ? el('div', { style: S.note }, native.message) : null,
+          native.error ? el('div', { style: S.warn }, native.error) : null,
+          native.compatibility ? el('div', { style: S.warn }, native.compatibility) : null),
+        el('div', { style: S.card },
           el('div', { style: S.title }, '说明'),
-          el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；拨动任一开关即视为同意重启，保存后立刻自动重启，不再二次确认。以后要加别的个人开关，往这里加卡片即可。')));
+          el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；「隐藏 API」与「思维链优先中文」保存后仍按原逻辑自动重启；「系统软件打开路径/程序」只保存 state.json，立即生效，不触发重启。以后要加别的个人开关，往这里加卡片即可。')));
     }
 
     function apply(ctx) {
+      ctx.effect(() => installNativeOpening(ctx), 'dsh-lqconfig: native opening');
+      ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+        name: 'shell.overlay', id: 'dsh-lqconfig.native-open-notice', order: 90,
+      }, NativeOpenNotice));
       ctx.slots.inject('settings.section', function* () {
         yield ctx.slots.register(
           { name: 'settings.section', id: 'dsh-lqconfig', order: 40, label: () => 'LQ配置' },

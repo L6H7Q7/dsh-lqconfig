@@ -1,10 +1,12 @@
 /**
  * dsh-lqconfig —— 个人配置插件（宿主半侧）
  *
- * 只做三件事：
+ * 个人设置与系统文件打开：
  *   1. 开关 DeepSeek API 通道（llm-deepseek 这一行）——写 profiles/desktop/cordis.patch.yml，带备份
  *   2. 开关「思维链优先中文」——改写三个 preset 里 persona.suffix（系统提示尾部），带备份
  *   3. 重启应用（确认后由本进程拉起外部脚本：延时 → 结束进程 → 重新启动）
+ *
+ *   4. 系统软件打开路径/程序——状态只写同目录 state.json，默认关闭，不需重启
  *
  * 路由前缀：/dsh-lqconfig/api/*（同源 HTTP，供设置页「LQ配置」使用）
  */
@@ -13,6 +15,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 export const name = 'dsh-lqconfig';
 export const inject = ['webServer'];
@@ -63,6 +66,191 @@ function stamp() {
   return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + ms;
 }
 
+// Native opening belongs to this plugin; it does not alter the profile patch.
+const nativeStatePath = fileURLToPath(new URL('./state.json', import.meta.url));
+
+export async function readNativeSettings() {
+  let text;
+  try { text = await fs.readFile(nativeStatePath, 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') return { openNative: false }; throw error; }
+  const value = JSON.parse(text.replace(/^\uFEFF/, ''));
+  if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.openNative !== 'boolean') {
+    throw new Error('系统打开设置格式无效：state.json 的 openNative 必须是布尔值');
+  }
+  return { openNative: value.openNative };
+}
+
+export async function writeNativeSettings(enabled) {
+  if (typeof enabled !== 'boolean') throw new Error('enabled 必须是布尔值');
+  await fs.writeFile(nativeStatePath, JSON.stringify({ openNative: enabled }, null, 2) + '\n', 'utf8');
+  return { openNative: enabled };
+}
+
+export function validateNativePath(value) {
+  if (typeof value !== 'string' || value.length === 0 || /[\x00-\x1f\x7f"<>|*?]/u.test(value)) {
+    throw new Error('路径为空或包含 Windows 路径不允许的字符');
+  }
+  const drive = /^[A-Za-z]:[\\/]/u.test(value);
+  const unc = /^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/u.test(value);
+  if (!drive && !unc) throw new Error('仅接受 Windows 盘符绝对路径或 UNC 路径');
+  if (/^(?:\\\\|\/\/)\.[\\/]/u.test(value)) throw new Error('不接受设备路径');
+  if (/#L\d+(?:-L?\d+)?$/iu.test(value)) throw new Error('带行号的链接仅在 Sidebar 中打开');
+  return value;
+}
+
+// Fixed source only: the target is data in the child environment, never code.
+const NATIVE_OPEN_POWERSHELL = [
+  "$ErrorActionPreference = 'Stop'",
+  '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)',
+  'try {',
+  "  $target = [Environment]::GetEnvironmentVariable('DSH_LQ_NATIVE_OPEN_PATH', 'Process')",
+  "  if ([string]::IsNullOrEmpty($target)) { throw 'Missing native path' }",
+  '  $info = New-Object System.Diagnostics.ProcessStartInfo',
+  '  $info.FileName = $target',
+  '  $info.UseShellExecute = $true',
+  "  $info.Verb = 'open'",
+  '  [void][System.Diagnostics.Process]::Start($info)',
+  "  [Console]::Out.Write('{\"submitted\":true,\"displayed\":null}')",
+  '  exit 0',
+  '} catch {',
+  '  $problem = $_.Exception',
+  '  while ($null -ne $problem.InnerException) { $problem = $problem.InnerException }',
+  '  $nativeCode = $null',
+  '  if ($problem -is [System.ComponentModel.Win32Exception]) { $nativeCode = $problem.NativeErrorCode }',
+  '  $failure = @{ submitted = $false; displayed = $null; code = $nativeCode; error = $problem.Message }',
+  '  [Console]::Out.Write(($failure | ConvertTo-Json -Compress))',
+  '  exit 1',
+  '}',
+].join('\n');
+const nativeEncodedCommand = Buffer.from(NATIVE_OPEN_POWERSHELL, 'utf16le').toString('base64');
+
+function launchNativePath(target) {
+  return new Promise((resolve, reject) => {
+    const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    let stdout = '', stderr = '', settled = false;
+    const child = spawn(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', nativeEncodedCommand], {
+      windowsHide: true,
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, DSH_LQ_NATIVE_OPEN_PATH: target },
+    });
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve(result);
+    };
+    const timer = setTimeout(() => {
+      child.kill();
+      const error = new Error('系统打开请求超时，结果无法确认；请先查看目标程序，避免重复打开');
+      error.code = 'native-timeout';
+      error.submitted = null;
+      finish(error);
+    }, 20000);
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(-16384); });
+    child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-16384); });
+    child.on('error', error => { error.submitted = false; finish(error); });
+    child.on('close', (exitCode, signal) => {
+      if (settled) return;
+      let result;
+      try { result = JSON.parse(stdout.trim()); } catch {}
+      if (exitCode === 0 && result?.submitted === true) {
+        finish(null, { submitted: true, displayed: null });
+        return;
+      }
+      const association = result?.code === 1155;
+      const error = new Error(association
+        ? '该文件类型尚无默认应用，请先在 Windows 中选择打开方式'
+        : result?.error || stderr.trim() || '系统打开进程未返回可确认的结果');
+      error.code = association ? 'association-required' : result?.code ?? 'native-open-failed';
+      error.nativeCode = result?.code ?? null;
+      error.exitCode = exitCode;
+      error.signal = signal;
+      error.stderr = stderr.trim();
+      error.submitted = result?.submitted === false ? false : null;
+      finish(error);
+    });
+  });
+}
+
+function revealNativeLocation(target, directory, select) {
+  const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'explorer.exe');
+  // An argv element, not a shell command. Node quotes spaces and trailing
+  // separators; validation already rejects embedded quotes and control bytes.
+  const args = select ? ['/select,' + target] : [directory];
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, {
+      shell: false, windowsHide: true, detached: true, stdio: 'ignore',
+    });
+    child.once('error', reject);
+    child.once('spawn', () => {
+      child.unref();
+      // A successful launch acknowledges the reveal request, not visibility
+      // of an Explorer window. Existing Explorer instances may handle it.
+      resolve({ fallback: 'revealed', fallbackPath: select ? target : directory, fallbackDisplayed: null });
+    });
+  });
+}
+
+async function fallbackNativeLocation(target, originalStat, targetMissing) {
+  let current = originalStat;
+  // Opening may have taken 20 seconds; recheck if the file moved meanwhile.
+  if (!targetMissing) {
+    try { current = await fs.stat(target); }
+    catch (error) {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') targetMissing = true;
+      else current = originalStat;
+    }
+  }
+  if (!targetMissing && current?.isDirectory()) return revealNativeLocation(target, target, false);
+  const parent = path.win32.dirname(target);
+  const parentStat = await fs.stat(parent);
+  if (!parentStat.isDirectory()) {
+    const error = new Error('父路径不是目录：' + parent);
+    error.code = 'ENOTDIR';
+    throw error;
+  }
+  return revealNativeLocation(target, parent, !targetMissing);
+}
+
+export async function openNativePath(value) {
+  const target = validateNativePath(value);
+  let stat;
+  try {
+    try { stat = await fs.stat(target); }
+    catch (cause) {
+      const error = new Error(cause.code === 'ENOENT' || cause.code === 'ENOTDIR'
+        ? '路径不存在：' + target : '无法访问路径：' + cause.message);
+      error.code = cause.code || 'path-unavailable';
+      error.submitted = false;
+      throw error;
+    }
+    if (!stat.isFile() && !stat.isDirectory()) {
+      const error = new Error('仅支持普通文件或目录');
+      error.code = 'not-regular-path';
+      error.submitted = false;
+      throw error;
+    }
+    return { ...(await launchNativePath(target)), fallback: null };
+  } catch (error) {
+    // Keep the original error and submission state, even when Explorer starts.
+    // Timeout stays null: the original program may already have received it.
+    error.code ||= 'native-open-failed';
+    if (!Object.prototype.hasOwnProperty.call(error, 'submitted')) error.submitted = false;
+    try {
+      Object.assign(error, await fallbackNativeLocation(target, stat,
+        stat === undefined && (error.code === 'ENOENT' || error.code === 'ENOTDIR')));
+    } catch (fallbackError) {
+      error.fallback = null;
+      error.fallbackError = { code: fallbackError.code || 'reveal-failed', message: fallbackError.message };
+    }
+    throw error;
+  }
+}
+
+
 export async function readState() {
   const file = patchPath();
   const exists = existsSync(file);
@@ -70,6 +258,7 @@ export async function readState() {
   return {
     enabled: !text.includes(BLOCK_START),
     chainZh: text.includes("suffix: '" + ZH_SUFFIX + "'"),
+    ...(await readNativeSettings()),
     exists,
     patchPath: file,
     exe: exePath(),
@@ -205,11 +394,45 @@ export function apply(ctx) {
               const result = await writeChainZh(body.enabled);
               return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
             }
+            if (req.method === 'POST' && (route === '/api/native-setting' || route === '/api/native-open')) {
+              if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) {
+                return sendJson(res, 415, { ok: false, error: '此接口需要 application/json' });
+              }
+              const body = await readBody(req);
+              if (route === '/api/native-setting') {
+                if (typeof body.enabled !== 'boolean') return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+                return sendJson(res, 200, { ok: true, ...(await writeNativeSettings(body.enabled)) });
+              }
+              if (!(await readNativeSettings()).openNative) {
+                return sendJson(res, 409, { ok: false, code: 'native-disabled', submitted: false, displayed: null, error: '系统打开开关已关闭' });
+              }
+              try { validateNativePath(body.path); }
+              catch (error) { return sendJson(res, 400, { ok: false, submitted: false, displayed: null, error: error.message }); }
+              return sendJson(res, 200, { ok: true, ...(await openNativePath(body.path)) });
+            }
             if (req.method === 'POST' && route === '/api/restart') {
               return sendJson(res, 200, { ok: true, ...(await restartApp()) });
             }
             return sendJson(res, 404, { ok: false, error: 'not found' });
           } catch (error) {
+            if (route === '/api/native-open') {
+              const failure = {
+                code: error.code || 'native-open-failed',
+                nativeCode: error.nativeCode ?? null,
+                message: error instanceof Error ? error.message : String(error),
+                exitCode: error.exitCode ?? null,
+                stderr: error.stderr || '',
+              };
+              return sendJson(res, 500, {
+                ok: false, error: failure, code: failure.code,
+                submitted: Object.prototype.hasOwnProperty.call(error, 'submitted') ? error.submitted : false,
+                displayed: null,
+                fallback: error.fallback || null,
+                fallbackPath: error.fallbackPath || null,
+                fallbackDisplayed: null,
+                fallbackError: error.fallbackError || null,
+              });
+            }
             return sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
           }
         },
