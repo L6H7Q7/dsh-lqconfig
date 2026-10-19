@@ -1,9 +1,10 @@
 /**
  * dsh-lqconfig —— 个人配置插件（宿主半侧）
  *
- * 只做两件事：
+ * 只做三件事：
  *   1. 开关 DeepSeek API 通道（llm-deepseek 这一行）——写 profiles/desktop/cordis.patch.yml，带备份
- *   2. 重启应用（确认后由本进程拉起外部脚本：延时 → 结束进程 → 重新启动）
+ *   2. 开关「思维链优先中文」——改写三个 preset 里 persona.suffix（系统提示尾部），带备份
+ *   3. 重启应用（确认后由本进程拉起外部脚本：延时 → 结束进程 → 重新启动）
  *
  * 路由前缀：/dsh-lqconfig/api/*（同源 HTTP，供设置页「LQ配置」使用）
  */
@@ -21,6 +22,16 @@ const BLOCK_START = '# >>> dsh-lqconfig: DeepSeek API 通道开关（自动生�
 const BLOCK_END = '# <<< dsh-lqconfig';
 const ROW_ID = 'llm-deepseek';
 const ROW_NAME = '@deepseek-ai/dsh-llm-deepseek-api-key';
+
+/**
+ * 思维链优先中文 —— 写进三个 preset 的 persona.suffix（系统提示尾部）。
+ * 实测依据：persona 是唯一落在系统提示里的注入点，比 AGENTS.md 的会话级指令权重更高。
+ */
+const ZH_SUFFIX =
+  '内部思考过程默认使用简体中文表达；技术术语、代码标识符、API 与产品专有名词保留原文英文；除非没有通行中文译法，否则不要整句使用英文。';
+
+/** 只匹配 persona 块里 10 空格缩进的 suffix: ''，不碰别的 suffix */
+const PLAIN_SUFFIX_RE = /(\n {10}suffix: )''(?=\n)/g;
 
 function dshHome() {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
@@ -58,6 +69,7 @@ export async function readState() {
   const text = exists ? await fs.readFile(file, 'utf8') : '';
   return {
     enabled: !text.includes(BLOCK_START),
+    chainZh: text.includes("suffix: '" + ZH_SUFFIX + "'"),
     exists,
     patchPath: file,
     exe: exePath(),
@@ -86,6 +98,30 @@ export async function writeEnabled(enabled) {
   }
 
   if (next === text) return { changed: false, backup: null };
+
+  const bak = file + '.bak-lqconfig-' + stamp();
+  await fs.copyFile(file, bak);
+  await fs.writeFile(file, next, 'utf8');
+  return { changed: true, backup: bak };
+}
+
+/**
+ * 开关「思维链优先中文」：只改 persona 的 suffix 一行，其余字符一律不动。
+ * 打开 = suffix: '' → suffix: '<ZH_SUFFIX>'；关闭 = 反向还原成 ''。
+ */
+export async function writeChainZh(enabled) {
+  const file = patchPath();
+  if (!existsSync(file)) throw new Error('找不到 profile patch：' + file);
+
+  const text = await fs.readFile(file, 'utf8');
+  const next = enabled
+    ? text.replace(PLAIN_SUFFIX_RE, (_match, head) => head + "'" + ZH_SUFFIX + "'")
+    : text.split("suffix: '" + ZH_SUFFIX + "'").join("suffix: ''");
+
+  if (next === text) return { changed: false, backup: null };
+  if (enabled && !next.includes(ZH_SUFFIX)) {
+    throw new Error('补丁里没找到 persona 的 suffix，未做任何改动');
+  }
 
   const bak = file + '.bak-lqconfig-' + stamp();
   await fs.copyFile(file, bak);
@@ -159,6 +195,14 @@ export function apply(ctx) {
                 return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
               }
               const result = await writeEnabled(body.enabled);
+              return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
+            }
+            if (req.method === 'POST' && route === '/api/chain-zh') {
+              const body = await readBody(req);
+              if (typeof body.enabled !== 'boolean') {
+                return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+              }
+              const result = await writeChainZh(body.enabled);
               return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
             }
             if (req.method === 'POST' && route === '/api/restart') {

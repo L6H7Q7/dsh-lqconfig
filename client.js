@@ -57,7 +57,7 @@ window.__ModuleLoader__.load({
           checked,
           disabled,
           onChange,
-          'aria-label': '隐藏 API',
+          'aria-label': props.label || '开关',
           style: { position: 'absolute', inset: 0, opacity: 0, margin: 0, zIndex: 1, cursor: disabled ? 'default' : 'pointer' },
         }),
         el('span', { style: { position: 'absolute', inset: 0, borderRadius: 12, background: checked ? '#1a1a1a' : 'rgba(128,128,128,0.35)', transition: 'background .2s' } }),
@@ -68,9 +68,13 @@ window.__ModuleLoader__.load({
       const [patchPath, setPatchPath] = useState('');
       const [hidden, setHidden] = useState(false);
       const [saving, setSaving] = useState(false);
-      const [notice, setNotice] = useState(false);
       const [message, setMessage] = useState('');
       const [tone, setTone] = useState('note');
+
+      const [chainZh, setChainZh] = useState(false);
+      const [chainSaving, setChainSaving] = useState(false);
+      const [chainMessage, setChainMessage] = useState('');
+      const [chainTone, setChainTone] = useState('note');
 
       useEffect(() => { void load(); }, []);
 
@@ -80,6 +84,7 @@ window.__ModuleLoader__.load({
           const data = await res.json();
           if (!data.ok) throw new Error(data.error || '读取失败');
           setHidden(!data.enabled);
+          setChainZh(Boolean(data.chainZh));
           setPatchPath(data.patchPath || '');
         } catch (error) {
           setMessage('读取失败：' + String(error && error.message ? error.message : error));
@@ -87,6 +92,7 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** 拨动开关即视为同意重启：写入成功后直接自动重启，不再弹二次确认 */
       async function persist(nextHidden) {
         setSaving(true);
         setMessage('');
@@ -100,19 +106,16 @@ window.__ModuleLoader__.load({
           if (!data.ok) throw new Error(data.error || '保存失败');
           setHidden(!data.enabled);
           if (data.changed) {
-            setNotice(true);
-            setMessage('已保存，重启后生效。');
-            setTone('ok');
-          } else {
-            setNotice(false);
-            setMessage('没有变化，无需重启。');
-            setTone('note');
+            await restartAt('api');
+            return;
           }
+          setMessage('没有变化，无需重启。');
+          setTone('note');
+          setSaving(false);
         } catch (error) {
           setHidden(!nextHidden);
           setMessage('保存失败：' + String(error && error.message ? error.message : error));
           setTone('warn');
-        } finally {
           setSaving(false);
         }
       }
@@ -120,20 +123,57 @@ window.__ModuleLoader__.load({
       function onToggle(event) {
         const next = event.target.checked;
         setHidden(next);
-        setNotice(false);
         void persist(next);
       }
 
-      async function restart() {
-        setSaving(true);
-        setMessage('正在重启，页面稍后会断开…');
-        setTone('note');
+      async function persistChain(next) {
+        setChainSaving(true);
+        setChainMessage('');
+        try {
+          const res = await fetch(API + '/chain-zh', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ enabled: next }),
+          });
+          const data = await res.json();
+          if (!data.ok) throw new Error(data.error || '保存失败');
+          setChainZh(Boolean(data.chainZh));
+          if (data.changed) {
+            await restartAt('chain');
+            return;
+          }
+          setChainMessage('没有变化，无需重启。');
+          setChainTone('note');
+          setChainSaving(false);
+        } catch (error) {
+          setChainZh(!next);
+          setChainMessage('保存失败：' + String(error && error.message ? error.message : error));
+          setChainTone('warn');
+          setChainSaving(false);
+        }
+      }
+
+      function onToggleChain(event) {
+        const next = event.target.checked;
+        setChainZh(next);
+        void persistChain(next);
+      }
+
+      /** which: 'api' | 'chain' —— 重启状态显示在触发它的那张卡片上 */
+      async function restartAt(which) {
+        const isChain = which === 'chain';
+        const setS = isChain ? setChainSaving : setSaving;
+        const setM = isChain ? setChainMessage : setMessage;
+        const setT = isChain ? setChainTone : setTone;
+        setS(true);
+        setM('正在重启，页面稍后会断开…');
+        setT('note');
         try {
           await fetch(API + '/restart', { method: 'POST' });
         } catch (error) {
-          setMessage('重启请求失败：' + String(error && error.message ? error.message : error));
-          setTone('warn');
-          setSaving(false);
+          setM('重启请求失败：' + String(error && error.message ? error.message : error));
+          setT('warn');
+          setS(false);
         }
       }
 
@@ -142,20 +182,20 @@ window.__ModuleLoader__.load({
           el('div', { style: S.head },
             el('div', { style: S.title }, '隐藏 API'),
             el(Switch, { checked: hidden, disabled: saving, onChange: onToggle })),
-          el('div', { style: S.desc }, '开启后，设置里的「DeepSeek」卡片和模型选择器里的「DeepSeek」分组都会消失；DeepSeek 账号通道不受影响。改动写进 profile 补丁，重启后生效。'),
+          el('div', { style: S.desc }, '开启后，设置里的「DeepSeek」卡片和模型选择器里的「DeepSeek」分组都会消失；DeepSeek 账号通道不受影响。改动写进 profile 补丁，拨动开关即自动重启生效。'),
           el('div', { style: S.status }, '当前：' + (hidden ? '已隐藏' : '显示中') + (saving ? ' · 处理中…' : '')),
-          notice
-            ? el('div', { style: S.notice },
-                el('span', null, '需要重启才能生效。'),
-                el('span', { style: { display: 'flex', gap: 8 } },
-                  el('button', { type: 'button', style: S.btn, disabled: saving, onClick: () => setNotice(false) }, '暂不重启'),
-                  el('button', { type: 'button', style: { ...S.btn, ...S.primary }, disabled: saving, onClick: restart }, '立即重启')))
-            : null,
           message ? el('div', { style: tone === 'warn' ? S.warn : tone === 'ok' ? S.ok : S.note }, message) : null,
           patchPath ? el('div', { style: S.mono }, '补丁：' + patchPath) : null),
         el('div', { style: S.card },
+          el('div', { style: S.head },
+            el('div', { style: S.title }, '思维链优先中文'),
+            el(Switch, { checked: chainZh, disabled: chainSaving, label: '思维链优先中文', onChange: onToggleChain })),
+          el('div', { style: S.desc }, '开启后，往三个 Agent 预设的 persona.suffix（系统提示尾部）写入「思考用简体中文，仅术语保留英文」；关闭后还原为空。改动写进 profile 补丁，拨动开关即自动重启生效。'),
+          el('div', { style: S.status }, '当前：' + (chainZh ? '已开启' : '未开启') + (chainSaving ? ' · 处理中…' : '')),
+          chainMessage ? el('div', { style: chainTone === 'warn' ? S.warn : chainTone === 'ok' ? S.ok : S.note }, chainMessage) : null),
+        el('div', { style: S.card },
           el('div', { style: S.title }, '说明'),
-          el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；以后要加别的个人开关，往这里加卡片即可。')));
+          el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；拨动任一开关即视为同意重启，保存后立刻自动重启，不再二次确认。以后要加别的个人开关，往这里加卡片即可。')));
     }
 
     function apply(ctx) {
