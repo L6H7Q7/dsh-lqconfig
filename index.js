@@ -6,7 +6,7 @@
  *   2. 开关「思维链优先中文」——改写三个 preset 里 persona.suffix（系统提示尾部），带备份
  *   3. 重启应用（确认后由本进程拉起外部脚本：延时 → 结束进程 → 重新启动）
  *
- *   4. 系统软件打开路径/程序——状态只写同目录 state.json，默认关闭，不需重启
+ *   4. 打开资源管理器和程序——状态只写同目录 state.json，默认关闭，不需重启
  *
  * 路由前缀：/dsh-lqconfig/api/*（同源 HTTP，供设置页「LQ配置」使用）
  */
@@ -185,8 +185,8 @@ function explorerTarget(windowsPath) {
 
 function revealNativeLocation(target, directory, select) {
   const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'explorer.exe');
-  const fallbackPath = select ? target : directory;
-  const uri = explorerTarget(fallbackPath);
+  const requestPath = select ? target : directory;
+  const uri = explorerTarget(requestPath);
   const args = select ? ['/select,', uri] : [uri];
   return new Promise((resolve, reject) => {
     let child, timer, settled = false, spawned = false, stderr = '';
@@ -195,21 +195,21 @@ function revealNativeLocation(target, directory, select) {
       settled = true;
       clearTimeout(timer);
       if (error) {
-        error.fallbackPath = fallbackPath;
-        error.fallbackSubmitted = spawned;
-        error.fallback ||= spawned ? 'unconfirmed' : null;
+        error.requestPath = requestPath;
+        error.submitted = spawned;
+        error.status ||= spawned ? 'unconfirmed' : null;
         error.stderr = stderr.trim();
         reject(error);
       } else resolve(result);
     };
-    // This is a separate acknowledgement budget, after the 3-second native
-    // opener budget. It never measures or claims Explorer-window visibility.
+    // Each parallel operation gets its own 3-second acknowledgement budget.
+    // Completion does not prove Explorer-window visibility.
     timer = setTimeout(() => {
       const error = new Error(spawned
         ? '定位进程未在 3 秒内返回委托结果；窗口是否出现未知，未终止资源管理器'
         : '定位进程未在 3 秒内确认启动；结果未知');
       error.code = spawned ? 'reveal-confirm-timeout' : 'reveal-start-timeout';
-      error.fallback = 'unconfirmed';
+      error.status = 'unconfirmed';
       error.exitCode = null;
       // Stop retaining this waiter and its pipes, not the GUI process.
       child?.unref();
@@ -233,9 +233,9 @@ function revealNativeLocation(target, directory, select) {
       if (settled) return;
       if (exitCode === 0 || exitCode === 1) {
         finish(null, {
-          fallback: 'delegated', fallbackSubmitted: true,
-          fallbackPath, fallbackDisplayed: null,
-          fallbackExitCode: exitCode, fallbackStderr: stderr.trim(),
+          status: 'delegated', submitted: true,
+          path: requestPath, displayed: null,
+          exitCode: exitCode, stderr: stderr.trim(),
         });
         return;
       }
@@ -244,24 +244,15 @@ function revealNativeLocation(target, directory, select) {
       error.exitCode = exitCode;
       error.signal = signal;
       // A completed non-handoff exit is a known failure, not an unknown wait.
-      error.fallback = 'failed';
+      error.status = 'failed';
       finish(error);
     });
   });
 }
 
 
-async function fallbackNativeLocation(target, originalStat, targetMissing) {
-  let current = originalStat;
-  // Recheck after the native opener wait in case the file moved meanwhile.
-  if (!targetMissing) {
-    try { current = await fs.stat(target); }
-    catch (error) {
-      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') targetMissing = true;
-      else current = originalStat;
-    }
-  }
-  if (!targetMissing && current?.isDirectory()) return revealNativeLocation(target, target, false);
+async function openExplorerForPath(target, stat, statError) {
+  if (stat?.isDirectory()) return revealNativeLocation(target, target, false);
   const parent = path.win32.dirname(target);
   const parentStat = await fs.stat(parent);
   if (!parentStat.isDirectory()) {
@@ -269,47 +260,60 @@ async function fallbackNativeLocation(target, originalStat, targetMissing) {
     error.code = 'ENOTDIR';
     throw error;
   }
-  return revealNativeLocation(target, parent, !targetMissing);
+  const missing = statError?.code === 'ENOENT' || statError?.code === 'ENOTDIR';
+  // This is the independent Explorer intent, not recovery from an app failure.
+  return revealNativeLocation(target, parent, !missing);
 }
 
-export async function openNativePath(value) {
+function nativeOperationError(error) {
+  return {
+    code: error.code || 'native-open-failed',
+    nativeCode: error.nativeCode ?? null,
+    message: error.message || String(error),
+    exitCode: error.exitCode ?? null,
+    stderr: error.stderr || '',
+  };
+}
+
+export async function openNativePath(value, operations = ['program', 'explorer']) {
   const target = validateNativePath(value);
-  let stat;
+  let stat, statError;
   try {
-    try { stat = await fs.stat(target); }
-    catch (cause) {
-      const error = new Error(cause.code === 'ENOENT' || cause.code === 'ENOTDIR'
-        ? '路径不存在：' + target : '无法访问路径：' + cause.message);
-      error.code = cause.code || 'path-unavailable';
-      error.submitted = false;
-      throw error;
-    }
+    stat = await fs.stat(target);
     if (!stat.isFile() && !stat.isDirectory()) {
-      const error = new Error('仅支持普通文件或目录');
-      error.code = 'not-regular-path';
-      error.submitted = false;
-      throw error;
+      statError = Object.assign(new Error('仅支持普通文件或目录'), { code: 'not-regular-path', submitted: false });
     }
-    return { ...(await launchNativePath(target)), fallback: null };
-  } catch (error) {
-    // Keep the original error and submission state, even when Explorer starts.
-    // Timeout stays null: the original program may already have received it.
-    error.code ||= 'native-open-failed';
-    if (!Object.prototype.hasOwnProperty.call(error, 'submitted')) error.submitted = false;
-    try {
-      Object.assign(error, await fallbackNativeLocation(target, stat,
-        stat === undefined && (error.code === 'ENOENT' || error.code === 'ENOTDIR')));
-    } catch (fallbackError) {
-      error.fallback = fallbackError.fallback || null;
-      error.fallbackPath = fallbackError.fallbackPath || null;
-      error.fallbackSubmitted = fallbackError.fallbackSubmitted ?? false;
-      error.fallbackError = {
-        code: fallbackError.code || 'reveal-failed', message: fallbackError.message,
-        exitCode: fallbackError.exitCode ?? null, stderr: fallbackError.stderr || '',
-      };
-    }
-    throw error;
+  } catch (cause) {
+    statError = new Error(cause.code === 'ENOENT' || cause.code === 'ENOTDIR'
+      ? '路径不存在：' + target : '无法访问路径：' + cause.message);
+    statError.code = cause.code || 'path-unavailable';
+    statError.submitted = false;
   }
+  // Start both intentions now. Neither launch waits for the other to fail.
+  // Explicit retries can request only the operation that did not complete.
+  const [program, explorer] = await Promise.allSettled([
+    operations.includes('program')
+      ? (statError ? Promise.reject(statError) : launchNativePath(target))
+      : Promise.resolve(null),
+    operations.includes('explorer')
+      ? openExplorerForPath(target, stat, statError)
+      : Promise.resolve(null),
+  ]);
+  const report = { program: null, explorer: null };
+  if (operations.includes('program')) {
+    report.program = program.status === 'fulfilled'
+      ? { ok: true, ...program.value }
+      : { ok: false, submitted: Object.prototype.hasOwnProperty.call(program.reason, 'submitted') ? program.reason.submitted : false,
+        displayed: null, error: nativeOperationError(program.reason) };
+  }
+  if (operations.includes('explorer')) {
+    report.explorer = explorer.status === 'fulfilled'
+      ? { ok: true, ...explorer.value }
+      : { ok: false, status: explorer.reason.status || 'failed', submitted: explorer.reason.submitted ?? false,
+        path: explorer.reason.requestPath || target, displayed: null, error: nativeOperationError(explorer.reason) };
+  }
+  const ok = [report.program, report.explorer].filter(Boolean).every(result => result.ok);
+  return { ok, ...report, ...(ok ? {} : { error: { code: 'open-operations-incomplete', message: '部分打开请求未完成' } }) };
 }
 
 
@@ -470,34 +474,19 @@ export function apply(ctx) {
               }
               try { validateNativePath(body.path); }
               catch (error) { return sendJson(res, 400, { ok: false, submitted: false, displayed: null, error: error.message }); }
-              return sendJson(res, 200, { ok: true, ...(await openNativePath(body.path)) });
+              const operations = body.operations ?? ['program', 'explorer'];
+              if (!Array.isArray(operations) || operations.length === 0 || operations.length > 2 ||
+                  new Set(operations).size !== operations.length || operations.some(value => value !== 'program' && value !== 'explorer')) {
+                return sendJson(res, 400, { ok: false, error: 'operations 仅接受 program、explorer' });
+              }
+              const result = await openNativePath(body.path, operations);
+              return sendJson(res, result.ok ? 200 : 500, result);
             }
             if (req.method === 'POST' && route === '/api/restart') {
               return sendJson(res, 200, { ok: true, ...(await restartApp()) });
             }
             return sendJson(res, 404, { ok: false, error: 'not found' });
           } catch (error) {
-            if (route === '/api/native-open') {
-              const failure = {
-                code: error.code || 'native-open-failed',
-                nativeCode: error.nativeCode ?? null,
-                message: error instanceof Error ? error.message : String(error),
-                exitCode: error.exitCode ?? null,
-                stderr: error.stderr || '',
-              };
-              return sendJson(res, 500, {
-                ok: false, error: failure, code: failure.code,
-                submitted: Object.prototype.hasOwnProperty.call(error, 'submitted') ? error.submitted : false,
-                displayed: null,
-                fallback: error.fallback || null,
-                fallbackPath: error.fallbackPath || null,
-                fallbackDisplayed: null,
-                fallbackSubmitted: error.fallbackSubmitted ?? false,
-                fallbackExitCode: error.fallbackExitCode ?? null,
-                fallbackStderr: error.fallbackStderr || '',
-                fallbackError: error.fallbackError || null,
-              });
-            }
             return sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) });
           }
         },

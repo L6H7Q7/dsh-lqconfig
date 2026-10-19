@@ -89,10 +89,8 @@ window.__ModuleLoader__.load({
         const detail = data.error && typeof data.error === 'object' ? data.error : null;
         const error = new Error(detail?.message || data.error || '请求失败（HTTP ' + response.status + '）');
         error.code = detail?.code ?? data.code;
-        error.submitted = data.submitted;
-        error.fallback = data.fallback;
-        error.fallbackPath = data.fallbackPath;
-        error.fallbackError = data.fallbackError;
+        error.program = data.program;
+        error.explorer = data.explorer;
         throw error;
       }
       return data;
@@ -134,28 +132,39 @@ window.__ModuleLoader__.load({
       return /^[A-Za-z]:[\\/]/u.test(target) || /^(?:\\\\|\/\/)[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/u.test(target) ? target : null;
     }
     let nativeNoticeSequence = 0;
-    async function requestNativeOpen(target, retryId) {
+    async function requestNativeOpen(target, retryId, operations) {
       if (nativeDisposed || !nativeSnapshot.openNative) return;
       const id = ++nativeNoticeSequence;
       if (retryId !== undefined && nativeSnapshot.notice?.id === retryId) {
         publishNative({ notice: { ...nativeSnapshot.notice, id, busy: true } });
       }
       try {
-        await nativeJson('/native-open', { path: target });
+        await nativeJson('/native-open', { path: target, ...(operations ? { operations } : {}) });
         if (!nativeDisposed && id === nativeNoticeSequence) {
-          publishNative({ message: '系统已接受打开请求；文件是否显示尚未核实。', notice: null });
+          publishNative({ message: '打开请求已提交；窗口是否出现尚未核实。', notice: null });
         }
       } catch (error) {
-        if (!nativeDisposed && id === nativeNoticeSequence) publishNative({ notice: {
-          id, path: target, busy: false,
-          message: error.fallback === 'delegated' || error.fallback === 'revealed'
-            ? '文件未能用系统程序打开，已请求打开所在文件夹' : error.message,
-          detail: error.fallback === 'delegated' || error.fallback === 'revealed' ? error.message : '',
-          fallbackPath: error.fallbackPath,
-          code: error.code,
-          fallbackError: error.fallbackError,
-          unknown: error.submitted === null || error.fallback === 'unconfirmed',
-        } });
+        if (!nativeDisposed && id === nativeNoticeSequence) {
+          const results = [
+            { key: 'program', label: '系统程序', result: error.program },
+            { key: 'explorer', label: '资源管理器', result: error.explorer },
+          ].filter(item => item.result);
+          const retryOperations = results.length ? results.filter(item => !item.result.ok).map(item => item.key) : operations || ['program', 'explorer'];
+          publishNative({ notice: {
+            id, path: target, busy: false,
+            message: results.length ? '打开请求结果' : error.message,
+            detail: results.map(item => item.label + '：' + (item.result.ok
+              ? '请求已提交，窗口是否出现尚未核实'
+              : item.result.error.message + '（' + item.result.error.code + '）')).join('\n'),
+            location: error.explorer?.path,
+            code: results.length ? undefined : error.code,
+            unknown: results.some(item => item.result.submitted === null || item.result.status === 'unconfirmed'),
+            retryOperations,
+            retryLabel: retryOperations.length === 1
+              ? retryOperations[0] === 'program' ? '仅重试系统程序' : '仅重试资源管理器'
+              : '重试未完成的请求',
+          } });
+        }
       }
     }
     function dismissNativeNotice(id) {
@@ -166,12 +175,12 @@ window.__ModuleLoader__.load({
     function NativeOpenNotice() {
       const state = useNativeState();
       const notice = state.notice;
-      const [remaining, setRemaining] = useState(10);
+      const [remaining, setRemaining] = useState(3);
       useEffect(() => {
-        setRemaining(10);
+        setRemaining(3);
         if (!notice || notice.busy) return;
         const id = notice.id;
-        const deadline = Date.now() + 10000;
+        const deadline = Date.now() + 3000;
         const timer = setInterval(() => {
           if (nativeDisposed || nativeSnapshot.notice?.id !== id || nativeSnapshot.notice.busy) {
             clearInterval(timer);
@@ -194,16 +203,15 @@ window.__ModuleLoader__.load({
       } },
         el('strong', null, notice.unknown ? '系统打开结果无法确认' : '系统打开未完成'),
         el('div', { style: { marginTop: 8, whiteSpace: 'pre-wrap' } }, notice.message),
-        notice.detail ? el('div', { style: { marginTop: 6, opacity: .8 } }, '原始原因：' + notice.detail) : null,
+        notice.detail ? el('div', { style: { marginTop: 6, opacity: .8, whiteSpace: 'pre-wrap' } }, notice.detail) : null,
         notice.code !== undefined ? el('div', { style: { marginTop: 6, opacity: .8 } }, '错误码：' + notice.code) : null,
-        notice.fallbackError ? el('div', { style: { marginTop: 6, opacity: .8 } }, '定位请求：' + notice.fallbackError.message + '（' + notice.fallbackError.code + '）') : null,
-        notice.fallbackPath ? el('div', { style: { marginTop: 6, wordBreak: 'break-all', opacity: .8 } }, '请求定位：' + notice.fallbackPath) : null,
+        notice.location ? el('div', { style: { marginTop: 6, wordBreak: 'break-all', opacity: .8 } }, '请求定位：' + notice.location) : null,
         el('div', { style: { marginTop: 6, wordBreak: 'break-all', opacity: .75 } }, notice.path),
         el('div', { style: { marginTop: 8, opacity: .75 } }, 'Sidebar 原有预览不受影响。'),
         el('div', { style: { display: 'flex', gap: 8, marginTop: 12 } },
-          state.openNative ? el('button', { type: 'button', style: S.btn, disabled: notice.busy,
-            onClick: () => { void requestNativeOpen(notice.path, notice.id); },
-          }, notice.busy ? '请求中…' : '仅重试系统打开') : null,
+          state.openNative && notice.retryOperations?.length ? el('button', { type: 'button', style: S.btn, disabled: notice.busy,
+            onClick: () => { void requestNativeOpen(notice.path, notice.id, notice.retryOperations); },
+          }, notice.busy ? '请求中…' : notice.retryLabel) : null,
           el('button', { type: 'button', style: S.btn, onClick: () => {
             dismissNativeNotice(notice.id);
           } }, notice.busy ? '关闭' : '关闭（' + remaining + 's）')));
@@ -389,17 +397,17 @@ window.__ModuleLoader__.load({
           chainMessage ? el('div', { style: chainTone === 'warn' ? S.warn : chainTone === 'ok' ? S.ok : S.note }, chainMessage) : null),
         el('div', { style: S.card },
           el('div', { style: S.head },
-            el('div', { style: S.title }, '系统软件打开路径/程序'),
-            el(Switch, { checked: native.openNative, disabled: native.saving, label: '系统软件打开路径/程序',
+            el('div', { style: S.title }, '打开资源管理器和程序'),
+            el(Switch, { checked: native.openNative, disabled: native.saving, label: '打开资源管理器和程序',
               onChange: event => { void saveNativeSettings(event.target.checked); } })),
-          el('div', { style: S.desc }, '开启后，点击聊天里的本地绝对路径链接，会保留 Sidebar 原有预览，并用系统默认软件打开文件或目录。系统打开失败时尝试打开所在位置；行号链接、相对路径和网页链接保持原有行为。'),
+          el('div', { style: S.desc }, '开启后，点击聊天里的本地绝对路径链接，会保留 Sidebar 原有预览，同时请求资源管理器和默认程序打开该路径。资源管理器会选中文件或打开目录；两路分别报告结果。行号链接、相对路径和网页链接保持原有行为。'),
           el('div', { style: S.status }, '当前：' + (native.openNative ? '已开启' : '未开启') + (native.saving ? ' · 保存中…' : '') + ' · 保存即时生效'),
           native.message ? el('div', { style: S.note }, native.message) : null,
           native.error ? el('div', { style: S.warn }, native.error) : null,
           native.compatibility ? el('div', { style: S.warn }, native.compatibility) : null),
         el('div', { style: S.card },
           el('div', { style: S.title }, '说明'),
-          el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；「隐藏 API」与「思维链优先中文」保存后仍按原逻辑自动重启；「系统软件打开路径/程序」只保存 state.json，立即生效，不触发重启。以后要加别的个人开关，往这里加卡片即可。')));
+          el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；「隐藏 API」与「思维链优先中文」保存后仍按原逻辑自动重启；「打开资源管理器和程序」只保存 state.json，立即生效，不触发重启。以后要加别的个人开关，往这里加卡片即可。')));
     }
 
     function apply(ctx) {
