@@ -37,6 +37,7 @@
 - `client.js` —— 浏览器半：`settings.section` 分区
 - `proxy.js` —— 代理模块：订阅解析、内核生命周期、按偏好选节点
 - `package.json` —— 声明 `dsh.client`
+- `GLOBAL-RULES.md` —— DSH 全局规则汇总（由 `$DSH_HOME/AGENTS.md`、`rules/` 与表情包约定整理，运行时仍以原文件为准）
 
 ## 备注
 
