@@ -16,6 +16,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import * as proxy from './proxy.js';
 
 export const name = 'dsh-lqconfig';
 export const inject = ['webServer'];
@@ -435,6 +436,8 @@ async function readBody(req) {
 }
 
 export function apply(ctx) {
+  // 插件卸载时停掉内核，避免遗留孤儿进程
+  ctx.effect(() => () => { void proxy.stop().catch(() => {}); }, 'dsh-lqconfig: proxy cleanup');
   ctx.effect(
     () =>
       ctx.webServer.register({
@@ -484,6 +487,50 @@ export function apply(ctx) {
               }
               const result = await openNativePath(body.path, operations);
               return sendJson(res, result.ok ? 200 : 500, result);
+            }
+            if (route.startsWith('/api/proxy/')) {
+              const action = route.slice('/api/proxy/'.length);
+              if (req.method === 'GET' && action === 'state') {
+                const settings = await proxy.readSettings();
+                let host = '';
+                try { host = settings.url ? new URL(settings.url).host : ''; } catch { host = ''; }
+                return sendJson(res, 200, {
+                  ok: true,
+                  ...(await proxy.status()),
+                  hasUrl: Boolean(settings.url),
+                  host,
+                  url: settings.url ? host + '（已保存）' : '',
+                });
+              }
+              if (req.method === 'GET' && action === 'regions') {
+                return sendJson(res, 200, { ok: true, regions: await proxy.listRegions() });
+              }
+              if (req.method === 'GET' && action === 'nodes') {
+                const settings = await proxy.readSettings();
+                const { entries } = await proxy.refreshProvider(settings, false);
+                return sendJson(res, 200, {
+                  ok: true,
+                  nodes: entries.map((entry) => ({ name: entry.name, region: proxy.regionOf(entry.name) })),
+                });
+              }
+              if (req.method === 'POST' && action === 'set') {
+                const body = await readBody(req);
+                const patch = {};
+                if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
+                if (typeof body.url === 'string') patch.url = body.url;
+                if (Array.isArray(body.regions)) patch.regions = body.regions;
+                if (typeof body.port === 'number') patch.port = body.port;
+                const settings = await proxy.writeSettings(patch);
+                if (settings.enabled === false) await proxy.stop();
+                return sendJson(res, 200, { ok: true, ...(await proxy.status()) });
+              }
+              if (req.method === 'POST' && action === 'ensure') {
+                return sendJson(res, 200, { ok: true, ...(await proxy.ensure()) });
+              }
+              if (req.method === 'POST' && action === 'stop') {
+                return sendJson(res, 200, { ok: true, ...(await proxy.stop()) });
+              }
+              return sendJson(res, 404, { ok: false, error: 'not found' });
             }
             if (req.method === 'POST' && route === '/api/restart') {
               return sendJson(res, 200, { ok: true, ...(await restartApp()) });

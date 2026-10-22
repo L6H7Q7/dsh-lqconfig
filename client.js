@@ -264,6 +264,241 @@ window.__ModuleLoader__.load({
     }
 
 
+    function VisibleShellCard() {
+      const [visible, setVisible] = useState(true);
+      const [saving, setSaving] = useState(false);
+      const [message, setMessage] = useState('');
+      const [tone, setTone] = useState('note');
+
+      useEffect(() => {
+        let disposed = false;
+        (async () => {
+          try {
+            const res = await fetch('/visible-shell/api/state', { cache: 'no-store' });
+            const data = await res.json();
+            if (!data.ok) throw new Error(data.error || '读取失败');
+            if (!disposed) setVisible(data.visible !== false);
+          } catch (error) {
+            if (!disposed) {
+              setTone('warn');
+              setMessage('读取失败：' + String(error && error.message ? error.message : error));
+            }
+          }
+        })();
+        return () => { disposed = true; };
+      }, []);
+
+      async function persist(next) {
+        setVisible(next);
+        setSaving(true);
+        setMessage('');
+        try {
+          const res = await fetch('/visible-shell/api/visible', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ visible: next }),
+          });
+          const data = await res.json();
+          if (!data.ok) throw new Error(data.error || '保存失败');
+          setVisible(data.visible !== false);
+          setTone('ok');
+          setMessage('已保存，即时生效，无需重启。');
+        } catch (error) {
+          setVisible(!next);
+          setTone('warn');
+          setMessage('保存失败：' + String(error && error.message ? error.message : error));
+        } finally {
+          setSaving(false);
+        }
+      }
+
+      return el('div', { style: S.card },
+        el('div', { style: S.head },
+          el('div', { style: S.title }, '命令窗口'),
+          el(Switch, {
+            checked: visible,
+            disabled: saving,
+            label: '命令窗口',
+            onChange: event => { void persist(event.target.checked); },
+          })),
+        el('div', { style: S.desc }, '开启后，DSH 执行每条命令都会弹出一个真实的终端窗口，命令跑完窗口自动关闭，输出经日志回传对话；关闭后恢复隐藏执行（与官方内置一致）。开关由 visible-shell 插件提供，读写它的 state.json，即时生效、不重启。'),
+        el('div', { style: S.status }, '当前：' + (visible ? '每条命令弹窗' : '隐藏执行') + (saving ? ' · 保存中…' : '')),
+        message ? el('div', { style: tone === 'warn' ? S.warn : tone === 'ok' ? S.ok : S.note }, message) : null);
+    }
+
+    function ProxyCard() {
+      const [state, setState] = useState({ hasUrl: false, enabled: false, running: false, current: '', version: '', port: 0, host: '' });
+      const [urlInput, setUrlInput] = useState('');
+      const [regions, setRegions] = useState([]);
+      const [available, setAvailable] = useState([]);
+      const [busy, setBusy] = useState('');
+      const [message, setMessage] = useState('');
+      const [tone, setTone] = useState('note');
+
+      useEffect(() => { void load(); }, []);
+
+      async function call(path, init) {
+        const res = await fetch(API + path, init || {});
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || '请求失败');
+        return data;
+      }
+
+      async function load() {
+        try {
+          const data = await call('/proxy/state');
+          setState(data);
+          setRegions(Array.isArray(data.regions) ? data.regions : []);
+        } catch (error) {
+          setTone('warn');
+          setMessage('读取失败：' + String(error && error.message ? error.message : error));
+        }
+      }
+
+      async function loadRegions() {
+        setBusy('regions');
+        setMessage('');
+        try {
+          const data = await call('/proxy/regions');
+          setAvailable(data.regions || []);
+          if (data.regions && data.regions.length) {
+            setTone('ok');
+            setMessage('从订阅读到 ' + data.regions.length + ' 个地区');
+          } else {
+            setTone('warn');
+            setMessage('订阅里没读到地区，请检查链接');
+          }
+        } catch (error) {
+          setTone('warn');
+          setMessage('读取地区失败：' + String(error && error.message ? error.message : error));
+        }
+        setBusy('');
+      }
+
+      async function saveUrl() {
+        if (!urlInput.trim()) { setTone('warn'); setMessage('请先填入机场链接'); return; }
+        setBusy('url');
+        setMessage('');
+        try {
+          await call('/proxy/set', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: urlInput.trim() }) });
+          setUrlInput('');
+          await load();
+          await loadRegions();
+          setTone('ok');
+          setMessage('链接已保存，现在可以打开开关');
+        } catch (error) {
+          setTone('warn');
+          setMessage('保存链接失败：' + String(error && error.message ? error.message : error));
+        }
+        setBusy('');
+      }
+
+      async function toggle(next) {
+        if (next && !state.hasUrl) { setTone('warn'); setMessage('请先填写机场链接'); return; }
+        setBusy('toggle');
+        setMessage('');
+        try {
+          await call('/proxy/set', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: next }) });
+          if (next) {
+            setTone('note');
+            setMessage('内核启动中，正在按偏好测速选节点…');
+            const result = await call('/proxy/ensure', { method: 'POST' });
+            setTone('ok');
+            setMessage('已启动：' + result.region + ' / ' + result.node + '（' + result.delay + 'ms）');
+          } else {
+            setTone('note');
+            setMessage('已停止');
+          }
+          await load();
+        } catch (error) {
+          setTone('warn');
+          setMessage('操作失败：' + String(error && error.message ? error.message : error));
+          await load();
+        }
+        setBusy('');
+      }
+
+      function toggleRegion(name) {
+        setRegions((prev) => (prev.indexOf(name) >= 0 ? prev.filter((item) => item !== name) : prev.concat([name])));
+      }
+
+      async function saveRegions() {
+        setBusy('regions-save');
+        setMessage('');
+        try {
+          await call('/proxy/set', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ regions }) });
+          setTone('ok');
+          setMessage(regions.length ? '偏好已保存：' + regions.join(' → ') : '偏好已清空，将在全部节点里选最低延迟');
+          await load();
+        } catch (error) {
+          setTone('warn');
+          setMessage('保存偏好失败：' + String(error && error.message ? error.message : error));
+        }
+        setBusy('');
+      }
+
+      async function test() {
+        setBusy('test');
+        setMessage('测速中，最多十秒…');
+        try {
+          const result = await call('/proxy/ensure', { method: 'POST' });
+          setTone('ok');
+          setMessage('连通：' + result.region + ' / ' + result.node + '（' + result.delay + 'ms，共 ' + result.nodes + ' 个节点）');
+          await load();
+        } catch (error) {
+          setTone('warn');
+          setMessage('测试失败：' + String(error && error.message ? error.message : error));
+          await load();
+        }
+        setBusy('');
+      }
+
+      return el('div', { style: S.card },
+        el('div', { style: S.head },
+          el('div', { style: S.title }, '代理（机场）'),
+          el(Switch, {
+            checked: state.enabled,
+            disabled: busy !== '' || !state.hasUrl,
+            label: '代理开关',
+            onChange: (event) => { void toggle(event.target.checked); },
+          })),
+        el('div', { style: S.desc }, '填入机场订阅链接后开关才可用。开启后由内置 mihomo 内核按偏好地区挑延迟最低的节点；模型需要外网时按需拉起，关闭即停内核。'),
+        el('div', { style: { display: 'flex', gap: 8, marginTop: 12 } },
+          el('input', {
+            type: 'text',
+            value: urlInput,
+            placeholder: state.hasUrl ? ('已保存：' + state.host + '（重新填写可替换）') : 'https://…/api/v1/client/…?token=…',
+            onChange: (event) => setUrlInput(event.target.value),
+            style: { flex: 1, minWidth: 0, padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: 13 },
+          }),
+          el('button', { style: S.btn, onClick: () => { void saveUrl(); } }, '保存链接')),
+        el('div', { style: S.status },
+          '状态：' + (state.running ? '运行中 · ' + state.current : '未运行')
+          + (state.version ? ' · 内核 ' + state.version : '')
+          + (state.port ? ' · 端口 ' + state.port : '')
+          + (busy ? ' · 处理中…' : '')),
+        state.enabled ? el('div', { style: { marginTop: 14 } },
+          el('div', { style: { fontSize: 13, fontWeight: 600 } }, '节点偏好（点击顺序即优先级）'),
+          el('div', { style: S.note }, '不选则全部节点挑最低延迟；选多个则依次尝试，前一个地区全挂才用下一个。地区来自订阅实际内容。'),
+          el('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 } },
+            available.length === 0
+              ? el('span', { style: S.note }, '点「读取地区」从订阅取真实地区')
+              : available.map((item) => {
+                  const index = regions.indexOf(item.name);
+                  return el('button', {
+                    key: item.name,
+                    style: index >= 0 ? { ...S.btn, ...S.primary } : S.btn,
+                    onClick: () => toggleRegion(item.name),
+                  }, (index >= 0 ? (index + 1) + '. ' : '') + item.name + '（' + item.count + '）');
+                })),
+          el('div', { style: { display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' } },
+            el('button', { style: S.btn, onClick: () => { void loadRegions(); } }, '读取地区'),
+            el('button', { style: S.btn, onClick: () => { void saveRegions(); } }, '保存偏好'),
+            el('button', { style: S.btn, onClick: () => { void test(); } }, '测试并选节点'))) : null,
+        message ? el('div', { style: tone === 'warn' ? S.warn : tone === 'ok' ? S.ok : S.note }, message) : null,
+        el('div', { style: S.mono }, '偏好：' + (regions.length ? regions.join(' → ') : '未设置（全部节点里选最低）')));
+    }
+
     function LqSection() {
       const native = useNativeState();
       const [patchPath, setPatchPath] = useState('');
@@ -404,6 +639,8 @@ window.__ModuleLoader__.load({
           native.message ? el('div', { style: S.note }, native.message) : null,
           native.error ? el('div', { style: S.warn }, native.error) : null,
           native.compatibility ? el('div', { style: S.warn }, native.compatibility) : null),
+        el(VisibleShellCard, {}),
+        el(ProxyCard, {}),
         el('div', { style: S.card },
           el('div', { style: S.title }, '说明'),
           el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；「隐藏 API」与「思维链优先中文」保存后仍按原逻辑自动重启；「打开资源管理器和程序」只保存 state.json，立即生效，不触发重启。以后要加别的个人开关，往这里加卡片即可。')));
