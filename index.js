@@ -279,8 +279,14 @@ function nativeOperationError(error) {
   };
 }
 
+const EXECUTABLE_EXT_RE = /\.(?:exe|com|bat|cmd|vbs|vbe|ps1|msi|lnk|scr)$/iu;
+
 export async function openNativePath(value, operations = ['program', 'explorer']) {
   const target = validateNativePath(value);
+  // 执行型文件只启动程序本身；再弹一个资源管理器定位没有任何意义。
+  const effective = EXECUTABLE_EXT_RE.test(target) && operations.includes('program')
+    ? ['program']
+    : operations;
   let stat, statError;
   try {
     stat = await fs.stat(target);
@@ -296,21 +302,21 @@ export async function openNativePath(value, operations = ['program', 'explorer']
   // Start both intentions now. Neither launch waits for the other to fail.
   // Explicit retries can request only the operation that did not complete.
   const [program, explorer] = await Promise.allSettled([
-    operations.includes('program')
+    effective.includes('program')
       ? (statError ? Promise.reject(statError) : launchNativePath(target))
       : Promise.resolve(null),
-    operations.includes('explorer')
+    effective.includes('explorer')
       ? openExplorerForPath(target, stat, statError)
       : Promise.resolve(null),
   ]);
   const report = { program: null, explorer: null };
-  if (operations.includes('program')) {
+  if (effective.includes('program')) {
     report.program = program.status === 'fulfilled'
       ? { ok: true, ...program.value }
       : { ok: false, submitted: Object.prototype.hasOwnProperty.call(program.reason, 'submitted') ? program.reason.submitted : false,
         displayed: null, error: nativeOperationError(program.reason) };
   }
-  if (operations.includes('explorer')) {
+  if (effective.includes('explorer')) {
     report.explorer = explorer.status === 'fulfilled'
       ? { ok: true, ...explorer.value }
       : { ok: false, status: explorer.reason.status || 'failed', submitted: explorer.reason.submitted ?? false,
@@ -398,7 +404,7 @@ async function restartApp() {
   const vbs = path.join(os.tmpdir(), 'dsh-lqconfig-restart.vbs');
   const lines = [
     'Set sh = CreateObject("WScript.Shell")',
-    'sh.Run "cmd /c timeout /t 2 /nobreak >nul & taskkill /f /im ""DeepSeek Harness.exe"" >nul 2>nul & start """" ""' +
+    'sh.Run "cmd /c timeout /t 2 /nobreak >nul & taskkill /f /im mihomo.exe >nul 2>nul & taskkill /f /im ""DeepSeek Harness.exe"" >nul 2>nul & start """" ""' +
       exe +
       '""", 0, False',
     '',
@@ -427,9 +433,33 @@ async function readBody(req) {
   }
 }
 
+let exitHookInstalled = false;
+
+/** 启动后多久预热代理（毫秒）。延迟避开 DSH 启动高峰，失败不影响启动。 */
+const WARMUP_DELAY_MS = 8000;
+
 export function apply(ctx) {
   // 插件卸载时停掉内核，避免遗留孤儿进程
-  ctx.effect(() => () => { void proxy.stop().catch(() => {}); }, 'dsh-lqconfig: proxy cleanup');
+  ctx.effect(() => () => { proxy.stopSync(); }, 'dsh-lqconfig: proxy cleanup');
+
+  // 开关打开时，启动后自动预热内核；不阻塞 apply，失败只记日志
+  let warmupTimer = setTimeout(() => {
+    warmupTimer = null;
+    void proxy.readSettings()
+      .then((settings) => {
+        if (!settings.enabled || !settings.url) return undefined;
+        return proxy.ensure();
+      })
+      .catch((error) => {
+        try { ctx.logger?.warn?.('[dsh-lqconfig] 代理预热失败：' + (error && error.message ? error.message : error)); } catch { /* 忽略 */ }
+      });
+  }, WARMUP_DELAY_MS);
+  ctx.effect(() => () => { if (warmupTimer !== null) { clearTimeout(warmupTimer); warmupTimer = null; } }, 'dsh-lqconfig: proxy warmup');
+  // 关窗口/退应用时即使插件 Dispose 没跑到，Node 退出也会同步收尾
+  if (!exitHookInstalled) {
+    exitHookInstalled = true;
+    process.on('exit', () => { try { proxy.stopSync(); } catch { /* 尽力而为 */ } });
+  }
   ctx.effect(
     () =>
       ctx.webServer.register({

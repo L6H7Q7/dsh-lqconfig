@@ -13,8 +13,8 @@
  *   proxy-data/providers/…      订阅解析后的节点（yaml 块列表）
  *   proxy.json                  链接、开关、偏好、端口
  */
-import { promises as fs, existsSync } from 'node:fs';
-import { spawn } from 'node:child_process';
+import { promises as fs, existsSync, readFileSync, rmSync } from 'node:fs';
+import { spawn, execFileSync } from 'node:child_process';
 import path from 'node:path';
 import net from 'node:net';
 import { fileURLToPath } from 'node:url';
@@ -282,14 +282,37 @@ async function api(settings, route, init) {
   });
 }
 
+/** PID 文件里的号可能已被系统复用；确认这个 PID 确实是 mihomo.exe 才动手 */
+function isMihomoPid(pid) {
+  try {
+    const out = execFileSync('tasklist', ['/FI', 'PID eq ' + pid, '/FO', 'CSV', '/NH'], {
+      encoding: 'utf8', windowsHide: true, timeout: 2000,
+    });
+    return /mihomo\.exe/i.test(out);
+  } catch {
+    return false;
+  }
+}
+
 async function killByPidFile() {
   try {
     const pid = Number((await fs.readFile(PID_FILE, 'utf8')).trim());
-    if (Number.isInteger(pid) && pid > 0) {
+    if (Number.isInteger(pid) && pid > 0 && isMihomoPid(pid)) {
       try { process.kill(pid); } catch { /* 已退出 */ }
     }
   } catch { /* 无 PID 文件 */ }
   await fs.rm(PID_FILE, { force: true });
+}
+
+/** 同步版停止：插件 dispose 时用——异步 Promise 来不及等进程退出 */
+export function stopSync() {
+  try {
+    const pid = Number(readFileSync(PID_FILE, 'utf8').trim());
+    if (Number.isInteger(pid) && pid > 0 && isMihomoPid(pid)) {
+      try { process.kill(pid); } catch { /* 已退出 */ }
+    }
+  } catch { /* 无 PID 文件 */ }
+  try { rmSync(PID_FILE, { force: true }); } catch { /* 忽略 */ }
 }
 
 export async function stop() {
@@ -321,6 +344,7 @@ export async function status() {
     port: settings.port,
     proxy: 'http://127.0.0.1:' + settings.port,
     regions: settings.regions,
+    refreshMinutes: settings.refreshMinutes,
     hasUrl: Boolean(settings.url),
     current,
     version,
