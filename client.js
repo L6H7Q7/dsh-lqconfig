@@ -662,6 +662,11 @@ window.__ModuleLoader__.load({
       const [chainMessage, setChainMessage] = useState('');
       const [chainTone, setChainTone] = useState('note');
 
+      const [purge, setPurge] = useState(false);
+      const [purgeSaving, setPurgeSaving] = useState(false);
+      const [purgeMessage, setPurgeMessage] = useState('');
+      const [purgeTone, setPurgeTone] = useState('note');
+
       useEffect(() => { void load(); }, []);
 
       async function load() {
@@ -671,6 +676,7 @@ window.__ModuleLoader__.load({
           if (!data.ok) throw new Error(data.error || '读取失败');
           setHidden(!data.enabled);
           setChainZh(Boolean(data.chainZh));
+          setPurge(Boolean(data.purge));
           setPatchPath(data.patchPath || '');
         } catch (error) {
           setMessage('读取失败：' + String(error && error.message ? error.message : error));
@@ -745,12 +751,47 @@ window.__ModuleLoader__.load({
         void persistChain(next);
       }
 
+      async function persistPurge(next) {
+        setPurgeSaving(true);
+        setPurgeMessage('');
+        try {
+          const res = await fetch(API + '/purge', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ on: next }),
+          });
+          const data = await res.json();
+          if (!data.ok) throw new Error((data.error || '保存失败') + (data.tail ? '：' + String(data.tail).slice(-400) : ''));
+          setPurge(Boolean(data.purge));
+          if (data.changed) {
+            if (data.note) { setPurgeMessage(data.note); setPurgeTone('note'); }
+            await restartAt('purge');
+            return;
+          }
+          setPurgeMessage('没有变化，无需重启。');
+          setPurgeTone('note');
+          setPurgeSaving(false);
+        } catch (error) {
+          setPurge(!next);
+          setPurgeMessage('失败：' + String(error && error.message ? error.message : error));
+          setPurgeTone('warn');
+          setPurgeSaving(false);
+        }
+      }
+
+      function onTogglePurge(event) {
+        const next = event.target.checked;
+        setPurge(next);
+        void persistPurge(next);
+      }
+
       /** which: 'api' | 'chain' —— 重启状态显示在触发它的那张卡片上 */
       async function restartAt(which) {
         const isChain = which === 'chain';
-        const setS = isChain ? setChainSaving : setSaving;
-        const setM = isChain ? setChainMessage : setMessage;
-        const setT = isChain ? setChainTone : setTone;
+        const isPurge = which === 'purge';
+        const setS = isPurge ? setPurgeSaving : isChain ? setChainSaving : setSaving;
+        const setM = isPurge ? setPurgeMessage : isChain ? setChainMessage : setMessage;
+        const setT = isPurge ? setPurgeTone : isChain ? setChainTone : setTone;
         setS(true);
         setM('正在重启，页面稍后会断开…');
         setT('note');
@@ -779,6 +820,13 @@ window.__ModuleLoader__.load({
           el('div', { style: S.desc }, '开启后，往三个 Agent 预设的 persona.suffix（系统提示尾部）写入「思考用简体中文，仅术语保留英文」；关闭后还原为空。改动写进 profile 补丁，拨动开关即自动重启生效。'),
           el('div', { style: S.status }, '当前：' + (chainZh ? '已开启' : '未开启') + (chainSaving ? ' · 处理中…' : '')),
           chainMessage ? el('div', { style: chainTone === 'warn' ? S.warn : chainTone === 'ok' ? S.ok : S.note }, chainMessage) : null),
+        el('div', { style: S.card },
+          el('div', { style: S.head },
+            el('div', { style: S.title }, '超限模式'),
+            el(Switch, { checked: purge, disabled: purgeSaving, label: '超限模式', onChange: onTogglePurge })),
+          el('div', { style: S.desc }, '开启后挂载 dsh-purge 并给宿主打补丁：关掉宿主自带身份句、中性化 Web 面自称、complete 预设下保留注入、旁路 hooks 审批门。关闭会还原全部宿主补丁并移除挂载。每次切换都会重启 DSH。'),
+          el('div', { style: S.status }, '当前：' + (purge ? '已开启' : '未开启') + (purgeSaving ? ' · 处理中…' : '')),
+          purgeMessage ? el('div', { style: purgeTone === 'warn' ? S.warn : purgeTone === 'ok' ? S.ok : S.note }, purgeMessage) : null),
         el('div', { style: S.card },
           el('div', { style: S.head },
             el('div', { style: S.title }, '打开资源管理器和程序'),

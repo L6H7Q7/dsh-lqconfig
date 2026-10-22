@@ -11,7 +11,7 @@
  * 路由前缀：/dsh-lqconfig/api/*（同源 HTTP，供设置页「LQ配置」使用）
  */
 import { promises as fs } from 'node:fs';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
@@ -22,6 +22,8 @@ export const name = 'dsh-lqconfig';
 export const inject = ['webServer'];
 
 const ROUTE_PREFIX = '/dsh-lqconfig';
+// 本进程 webServer 的监听端口，超限模式要用它调插件自己的同源路由。
+let localPort = 0;
 const BLOCK_START = '# >>> dsh-lqconfig: DeepSeek API 通道开关（自动生成，请勿手改）';
 const BLOCK_END = '# <<< dsh-lqconfig';
 const ROW_ID = 'llm-deepseek';
@@ -65,6 +67,121 @@ function stamp() {
   const p = (n) => String(n).padStart(2, '0');
   const ms = String(d.getMilliseconds()).padStart(3, '0');
   return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + ms;
+}
+
+// ── 超限模式（dsh-purge）────────────────────────────────────────────────
+// 开：往 profile patch 插 system-prompt 覆盖 + dsh-purge 挂载行，并跑插件 CLI 打宿主补丁。
+// 关：跑 CLI 还原宿主补丁，再整段移除挂载行。切换后必须重启 DSH 才生效。
+const PURGE_START = '# >>> dsh-lqconfig: 超限模式（dsh-purge，自动生成，请勿手改）';
+const PURGE_END = '# <<< dsh-lqconfig: 超限模式结束';
+
+function purgeDir() {
+  // 物理合并：插件本体在 lqconfig 目录下的 vendor/dsh-purge。
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), 'vendor', 'dsh-purge');
+}
+
+/** 「开」是两阶段：先挂载插件重启，重启后由本进程调插件自己的 /dsh-purge/apply。 */
+function purgePendingFlag() {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), '.purge-pending');
+}
+
+function markPurgePending(on) {
+  const flag = purgePendingFlag();
+  try {
+    if (on) writeFileSync(flag, new Date().toISOString(), 'utf8');
+    else if (existsSync(flag)) unlinkSync(flag);
+  } catch { /* 标记写失败最多导致多打一次补丁，不会卡死开关 */ }
+}
+
+export function hasPurgePending() {
+  return existsSync(purgePendingFlag());
+}
+
+/** 调插件自己注册的同源路由——只有进程内调用才能解开 app.asar。 */
+async function callPurgeRoute(route) {
+  const port = localPort;
+  if (!port) return { ok: false, error: 'webServer 端口未就绪' };
+  try {
+    const res = await fetch('http://127.0.0.1:' + port + route, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    const text = await res.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch { data = null; }
+    return { ok: res.ok && (data ? data.ok !== false : true), status: res.status, data, tail: text.slice(-1200) };
+  } catch (error) {
+    return { ok: false, error: String(error && error.message ? error.message : error) };
+  }
+}
+
+function purgeOnBlock() {
+  return [
+    PURGE_START,
+    '- id: system-prompt',
+    '  config:',
+    '    includeHarnessIdentity: false',
+    '    personaPrefix: ""',
+    '    personaSuffix: ""',
+    '- insert:',
+    '    - id: dsh-purge',
+    '      name: ./local/dsh-lqconfig/vendor/dsh-purge/lib/index.js',
+    '      inject: [systemPrompt, tools]',
+    '      config:',
+    '        enabled: true',
+    '        autoApplyOnStart: true',
+    '        autoUpdateOnStart: false',
+    '        autoRevertOnMissing: false',
+    '        injectOnce: false',
+    '        stripMnemon: true',
+    '        verbose: false',
+    '        postPrompt: ""',
+    '        postPromptOrder: 5100',
+    '        autoRetry: true',
+    '        retryMax: 3',
+    '        autoContinue: false',
+    '        continueMax: 3',
+    '        continueText: "继续"',
+    '        capabilityProtocol: true',
+    '        hooksDenyBypass: true',
+    // 演练台三个子插件：不挂上就没有 POST /redteam/api，面板会拿到 405。
+    '    - id: dsh-purge-redteam',
+    '      name: ./local/dsh-lqconfig/vendor/dsh-purge/lib/redteam/index.js',
+    '    - id: dsh-purge-redteam-store',
+    '      name: ./local/dsh-lqconfig/vendor/dsh-purge/lib/redteam/store.js',
+    '    - id: dsh-purge-redteam-ui',
+    '      name: ./local/dsh-lqconfig/vendor/dsh-purge/lib/redteam/ui.js',
+    PURGE_END,
+    '',
+  ].join('\n');
+}
+
+/** 已挂载时，由本进程触发插件补丁；未挂载时返回原因，交给重启后的第二阶段。 */
+async function applyPurgeInProcess() {
+  return await callPurgeRoute('/dsh-purge/apply');
+}
+
+/** 开关本体：on=true 追加挂载块；on=false 整段移除。 */
+export async function writePurgeMode(on) {
+  const file = patchPath();
+  if (!existsSync(file)) throw new Error('找不到 profile patch：' + file);
+  const text = await fs.readFile(file, 'utf8');
+  const hasBlock = text.includes(PURGE_START);
+  let next = text;
+  if (hasBlock) {
+    const start = text.indexOf(PURGE_START);
+    const end = text.indexOf(PURGE_END, start);
+    const cut = end >= 0 ? end + PURGE_END.length : text.length;
+    // 只删块本身，不碰其它段落之间的空行；结尾收成单换行。
+    next = (text.slice(0, start) + text.slice(cut)).replace(/\n+$/, '\n');
+  }
+  if (on) next = next.replace(/\s*$/, '\n') + '\n' + purgeOnBlock();
+  if (next === text) return { changed: false, backup: null };
+  const bak = file + '.bak-lqconfig-' + stamp();
+  await fs.copyFile(file, bak);
+  await fs.writeFile(file, next, 'utf8');
+  return { changed: true, backup: bak };
 }
 
 // Native opening belongs to this plugin; it does not alter the profile patch.
@@ -334,6 +451,7 @@ export async function readState() {
   return {
     enabled: !text.includes(BLOCK_START),
     chainZh: text.includes("suffix: '" + ZH_SUFFIX + "'"),
+    purge: text.includes(PURGE_START),
     ...(await readNativeSettings()),
     exists,
     patchPath: file,
@@ -398,23 +516,21 @@ async function restartApp() {
   const exe = exePath();
   if (!existsSync(exe)) throw new Error('找不到应用可执行文件：' + exe);
 
-  // 脚本方式：写 VBS 后直接由 wscript 执行，不注册计划任务。
-  // VBS 内容全 ASCII，避免 wscript 按 ANSI 读 UTF-8 中文时炸「无效字符」。
-  // 窗口样式 0 = 隐藏；延时 2 秒让 HTTP 响应先回到页面。
-  const vbs = path.join(os.tmpdir(), 'dsh-lqconfig-restart.vbs');
-  const lines = [
-    'Set sh = CreateObject("WScript.Shell")',
-    'sh.Run "cmd /c timeout /t 2 /nobreak >nul & taskkill /f /im mihomo.exe >nul 2>nul & taskkill /f /im ""DeepSeek Harness.exe"" >nul 2>nul & start """" ""' +
-      exe +
-      '""", 0, False',
-    '',
-  ];
-  await fs.writeFile(vbs, lines.join('\r\n'), 'utf8');
-
-  const { spawn } = await import('node:child_process');
-  const child = spawn('wscript.exe', ['//B', vbs], { detached: true, stdio: 'ignore', windowsHide: true });
+  // 旧写法（wscript → cmd → start exe）在宿主里必然把 EXE 起成纯 Node：
+  // 宿主自己是 ELECTRON_RUN_AS_NODE=1 跑的，cmd 和 start 全继承这个变量，
+  // 新实例没有窗口、立刻退出 —— 表现就是「只关闭不打开」。
+  // 手动点 restart-dsh.vbs 正常，是因为它由 explorer 拉起，环境干净。
+  // 现在交给独立助手进程：它自己以 Node 模式跑，拉起 EXE 前把变量洗掉。
+  const helper = fileURLToPath(new URL('./restart-helper.mjs', import.meta.url));
+  const child = spawn(process.execPath, [helper, exe], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    cwd: path.dirname(helper),
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+  });
   child.unref();
-  return { exe, vbs, pid: child.pid };
+  return { exe, helper, pid: child.pid };
 }
 
 function sendJson(res, status, obj) {
@@ -441,6 +557,27 @@ const WARMUP_DELAY_MS = 8000;
 export function apply(ctx) {
   // 插件卸载时停掉内核，避免遗留孤儿进程
   ctx.effect(() => () => { proxy.stopSync(); }, 'dsh-lqconfig: proxy cleanup');
+
+  try { localPort = Number(ctx.webServer?.port) || 0; } catch { localPort = 0; }
+
+  // 超限模式第二阶段：开关是把「挂载」写进 profile 的，插件要重启后才在进程里，
+  // 所以补丁只能在这次启动后由这里调它自己的 /dsh-purge/apply。带重试，成功后清标记。
+  if (hasPurgePending()) {
+    const timer = setTimeout(async () => {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const result = await callPurgeRoute('/dsh-purge/apply');
+        if (result.ok) {
+          markPurgePending(false);
+          try { ctx.logger?.info?.('[dsh-lqconfig] 超限模式补丁已应用'); } catch { /* 忽略 */ }
+          return;
+        }
+        await new Promise((resolve) => { const t = setTimeout(resolve, 3000); t.unref?.(); });
+      }
+      try { ctx.logger?.warn?.('[dsh-lqconfig] 超限模式补丁应用失败：插件路由一直没就绪'); } catch { /* 忽略 */ }
+    }, 6000);
+    timer.unref?.();
+    ctx.effect(() => () => clearTimeout(timer), 'dsh-lqconfig: purge apply');
+  }
 
   // 开关打开时，启动后自动预热内核；不阻塞 apply，失败只记日志
   let warmupTimer = setTimeout(() => {
@@ -487,6 +624,27 @@ export function apply(ctx) {
               }
               const result = await writeChainZh(body.enabled);
               return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
+            }
+            if (req.method === 'POST' && route === '/api/purge') {
+              const body = await readBody(req);
+              if (typeof body.on !== 'boolean') {
+                return sendJson(res, 400, { ok: false, error: 'on 必须是布尔值' });
+              }
+              if (body.on) {
+                // 开：先挂载（重启后插件才在进程里），打补丁交给重启后的第二阶段。
+                const result = await writePurgeMode(true);
+                markPurgePending(true);
+                return sendJson(res, 200, {
+                  ok: true, ...result, pending: true,
+                  note: '已写入挂载，重启后由插件自行解开 app.asar 并打补丁（可能再自动重启一次）。',
+                  ...(await readState()),
+                });
+              }
+              // 关：此刻插件还挂在进程里，先让它原地还原宿主补丁，再摘挂载。
+              const revert = await callPurgeRoute('/dsh-purge/revert');
+              markPurgePending(false);
+              const result = await writePurgeMode(false);
+              return sendJson(res, 200, { ok: true, ...result, revert, ...(await readState()) });
             }
             if (req.method === 'POST' && (route === '/api/native-setting' || route === '/api/native-open')) {
               if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) {
