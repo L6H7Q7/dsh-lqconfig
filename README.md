@@ -32,6 +32,8 @@
 
 重启 DSH 后，设置 → LQ配置。
 
+仓库已自带 `bin/mihomo.exe`（v1.19.33，61 MB），clone 下来即可用，不需要另外下载内核——只有删掉它，代理功能才会报「找不到内核」。该内核为 **Windows x64** 二进制。
+
 ## 结构
 
 - `index.js` —— 宿主半：`/dsh-lqconfig/api/state|set|chain-zh|restart|proxy/*`
@@ -106,6 +108,6 @@
 | 文件 | 说明 | 入库 |
 |---|---|---|
 | `proxy.js` | 订阅解析、内核生命周期、按偏好选节点 | 是 |
-| `bin/mihomo.exe` | 官方 mihomo 内核（v1.19.33，61 MB） | 否 |
+| `bin/mihomo.exe` | 官方 mihomo 内核（v1.19.33，61 MB，随仓库分发） | 是 |
 | `proxy.json` | 订阅链接、开关、偏好、端口 | 否（含 token） |
 | `proxy-data/` | 生成的 config、provider 缓存、PID | 否 |
