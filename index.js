@@ -128,11 +128,14 @@ function launchNativePath(target) {
   return new Promise((resolve, reject) => {
     const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
     let stdout = '', stderr = '', settled = false;
+    const env = { ...process.env, DSH_LQ_NATIVE_OPEN_PATH: target };
+    // The DSH host runs Electron as Node; inheriting this makes VS Code exit without showing a window.
+    delete env.ELECTRON_RUN_AS_NODE;
     const child = spawn(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', nativeEncodedCommand], {
       windowsHide: true,
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, DSH_LQ_NATIVE_OPEN_PATH: target },
+      env,
     });
     const finish = (error, result) => {
       if (settled) return;

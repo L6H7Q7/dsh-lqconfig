@@ -235,11 +235,10 @@ window.__ModuleLoader__.load({
           const Original = entry.component;
           if (typeof Original !== 'function' || Original.name !== 'ChatView') continue;
           function NativeOpenChat(props) {
-            const openFile = React.useCallback(async (target, options) => {
-              const result = await props.openFile(target, options);
+            const openFile = React.useCallback((target, options) => {
               const nativePath = nativePathOf(target, options);
               if (!nativeDisposed && nativeSnapshot.openNative && nativePath !== null) void requestNativeOpen(nativePath);
-              return result;
+              return props.openFile(target, options);
             }, [props.openFile]);
             return el(Original, { ...props, openFile });
           }
