@@ -21,6 +21,104 @@ window.__ModuleLoader__.load({
 
     const API = '/dsh-lqconfig/api';
 
+    /* ---------------- 代理状态：侧边栏徽标与设置卡片共用 ---------------- */
+    let proxySnapshot = {
+      state: null, error: '', at: 0,
+      popover: false, busy: '', message: '', tone: 'note',
+    };
+    const proxySubscribers = new Set();
+    function publishProxy(patch) {
+      proxySnapshot = { ...proxySnapshot, ...patch };
+      for (const listener of [...proxySubscribers]) listener();
+    }
+    function useProxyStatus() {
+      return React.useSyncExternalStore(
+        React.useCallback((listener) => { proxySubscribers.add(listener); return () => proxySubscribers.delete(listener); }, []),
+        () => proxySnapshot,
+      );
+    }
+    let proxyRequestId = 0;
+    async function refreshProxyStatus() {
+      const id = ++proxyRequestId;
+      try {
+        const response = await fetch(API + '/proxy/state', { cache: 'no-store' });
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'HTTP ' + response.status);
+        if (id === proxyRequestId) publishProxy({ state: data, error: '', at: Date.now() });
+      } catch (error) {
+        if (id === proxyRequestId) publishProxy({ error: String(error && error.message ? error.message : error) });
+      }
+    }
+    /** 多个挂载点共用同一份轮询，最后一个卸下时停表 */
+    let proxyPollTimer = null;
+    let proxyPollUsers = 0;
+    function acquireProxyPolling() {
+      proxyPollUsers += 1;
+      if (proxyPollTimer === null) {
+        void refreshProxyStatus();
+        proxyPollTimer = setInterval(() => {
+          if (typeof document !== 'undefined' && document.hidden) return;
+          if (proxySnapshot.busy) return;
+          void refreshProxyStatus();
+        }, 20000);
+        if (typeof document !== 'undefined') {
+          document.addEventListener('visibilitychange', onProxyVisibility);
+        }
+      }
+      return () => {
+        proxyPollUsers -= 1;
+        if (proxyPollUsers > 0 || proxyPollTimer === null) return;
+        clearInterval(proxyPollTimer);
+        proxyPollTimer = null;
+        if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onProxyVisibility);
+      };
+    }
+    function onProxyVisibility() {
+      if (typeof document !== 'undefined' && !document.hidden) void refreshProxyStatus();
+    }
+
+    /**
+     * 打开「设置 → LQ配置」。宿主没有对外暴露「打开设置 / 选中分区」的接口，
+     * 只能在 DOM 层点：侧边栏设置按钮（_triggerRow 里的 aria-haspopup=dialog 按钮），
+     * 再点设置导航里文案为「LQ配置」的 _navCell。
+     */
+    function openLqSettings() {
+      const trigger = document.querySelector('[class*="_triggerRow"] button[aria-haspopup="dialog"]')
+        || [...document.querySelectorAll('button[aria-haspopup="dialog"][aria-label]')]
+          .find((btn) => /设置|settings?/i.test((btn.getAttribute('aria-label') || '').trim()));
+      if (trigger && trigger.getAttribute('aria-expanded') !== 'true') trigger.click();
+      let attempt = 0;
+      const pickSection = () => {
+        const nav = [...document.querySelectorAll('button[class*="_navCell"]')]
+          .find((btn) => (btn.textContent || '').trim() === 'LQ配置');
+        if (nav) { nav.click(); return; }
+        attempt += 1;
+        if (attempt < 25) setTimeout(pickSection, 60);
+      };
+      setTimeout(pickSection, 60);
+      return Boolean(trigger);
+    }
+
+    function timeAgo(ms) {
+      if (!ms) return '无记录';
+      const diff = Math.max(0, Date.now() - ms);
+      if (diff < 60000) return '刚刚';
+      const minutes = Math.floor(diff / 60000);
+      if (minutes < 60) return minutes + ' 分钟前';
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return hours + ' 小时前';
+      return Math.floor(hours / 24) + ' 天前';
+    }
+    function durationText(ms) {
+      if (!ms || ms < 0) return '—';
+      const minutes = Math.floor(ms / 60000);
+      if (minutes < 1) return '不到 1 分钟';
+      if (minutes < 60) return minutes + ' 分钟';
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return hours + ' 小时 ' + (minutes % 60) + ' 分';
+      return Math.floor(hours / 24) + ' 天 ' + (hours % 24) + ' 小时';
+    }
+
     const S = {
       page: { padding: '8px 4px', fontSize: 14, lineHeight: 1.6 },
       card: { border: '1px solid rgba(128,128,128,0.28)', borderRadius: 12, padding: '16px 18px', marginBottom: 12 },
@@ -337,7 +435,14 @@ window.__ModuleLoader__.load({
       const [message, setMessage] = useState('');
       const [tone, setTone] = useState('note');
 
-      useEffect(() => { void load(); }, []);
+      useEffect(() => {
+        void load();
+        const timer = setInterval(() => {
+          if (typeof document !== 'undefined' && document.hidden) return;
+          void load();
+        }, 20000);
+        return () => clearInterval(timer);
+      }, []);
 
       async function call(path, init) {
         const res = await fetch(API + path, init || {});
@@ -405,7 +510,7 @@ window.__ModuleLoader__.load({
           await call('/proxy/set', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: next }) });
           if (next) {
             setTone('ok');
-            setMessage('已允许 DSH 按需使用代理。内核不会现在启动，等真正需要时或点「测试并选节点」才拉起。');
+            setMessage('已允许 DSH 按需使用代理。内核不会现在启动，等真正需要时或点「测试延迟并刷新节点」才拉起。');
           } else {
             setTone('note');
             setMessage('已禁止使用代理，已停止内核');
@@ -459,11 +564,15 @@ window.__ModuleLoader__.load({
 
       async function test() {
         setBusy('test');
-        setMessage('测速中，最多十秒…');
+        setMessage('刷新订阅并测速中，最多十几秒…');
         try {
-          const result = await call('/proxy/ensure', { method: 'POST' });
+          const result = await call('/proxy/ensure', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ force: true }),
+          });
           setTone('ok');
-          setMessage('连通：' + result.region + ' / ' + result.node + '（' + result.delay + 'ms，共 ' + result.nodes + ' 个节点）');
+          setMessage((result.refreshed ? '订阅已刷新 · ' : '') + '连通：' + result.region + ' / ' + result.node + '（' + result.delay + 'ms，共 ' + result.nodes + ' 个节点）');
           await load();
         } catch (error) {
           setTone('warn');
@@ -482,7 +591,7 @@ window.__ModuleLoader__.load({
             label: '自动代理',
             onChange: (event) => { void toggle(event.target.checked); },
           })),
-        el('div', { style: S.desc }, '开启后，DSH 可以在需要时通过本插件自动切换代理、使用代理；关闭后禁止使用。开关只是授权，不会立刻启动内核——真正需要时（或点下方「测试并选节点」）才拉起。开关需要先填好机场链接。'),
+        el('div', { style: S.desc }, '开启后，DSH 可以在需要时通过本插件自动切换代理、使用代理；关闭后禁止使用。开关只是授权，不会立刻启动内核——真正需要时（或点下方「测试延迟并刷新节点」）才拉起。开关需要先填好机场链接。'),
         el('div', { style: { display: 'flex', gap: 8, marginTop: 12 } },
           el('input', {
             type: 'text',
@@ -508,10 +617,16 @@ window.__ModuleLoader__.load({
           el('button', { style: S.btn, onClick: () => { void saveTuning(); } }, '保存'),
           el('span', { style: S.note }, '改端口要关开关重开才生效；刷新时间下次拉订阅时生效')),
         el('div', { style: S.status },
-          '状态：' + (state.running ? '运行中 · ' + state.current : '未运行')
+          '状态：' + (state.running ? '运行中' : '未运行')
+          + (state.running && state.current ? ' · ' + state.current : '')
+          + (state.delay ? ' · ' + state.delay + ' ms' : '')
           + (state.version ? ' · 内核 ' + state.version : '')
           + (state.port ? ' · 端口 ' + state.port : '')
+          + (state.running && state.startedAt ? ' · 已运行 ' + durationText(Date.now() - state.startedAt) : '')
           + (busy ? ' · 处理中…' : '')),
+        el('div', { style: S.mono },
+          '订阅更新：' + (state.providerUpdatedAt ? timeAgo(state.providerUpdatedAt) : '未拉取')
+          + ' · 上次选节点：' + (state.lastPick ? timeAgo(state.lastPick.at) + '（' + state.lastPick.node + '）' : '无记录')),
         state.enabled ? el('div', { style: { marginTop: 14 } },
           el('div', { style: { fontSize: 13, fontWeight: 600 } }, '节点偏好（点击顺序即优先级）'),
           el('div', { style: S.note }, '不选则全部节点挑最低延迟；选多个则依次尝试，前一个地区全挂才用下一个。地区来自订阅实际内容。'),
@@ -529,7 +644,7 @@ window.__ModuleLoader__.load({
           el('div', { style: { display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' } },
             el('button', { style: S.btn, onClick: () => { void loadRegions(); } }, '读取地区'),
             el('button', { style: S.btn, onClick: () => { void saveRegions(); } }, '保存偏好'),
-            el('button', { style: S.btn, onClick: () => { void test(); } }, '测试并选节点'))) : null,
+            el('button', { style: S.btn, onClick: () => { void test(); } }, '测试延迟并刷新节点'))) : null,
         message ? el('div', { style: tone === 'warn' ? S.warn : tone === 'ok' ? S.ok : S.note }, message) : null,
         el('div', { style: S.mono }, '偏好：' + (regions.length ? regions.join(' → ') : '未设置（全部节点里选最低）')));
     }
@@ -681,11 +796,202 @@ window.__ModuleLoader__.load({
           el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；「隐藏 API」与「思维链优先中文」保存后仍按原逻辑自动重启；「打开资源管理器和程序」只保存 state.json，立即生效，不触发重启。以后要加别的个人开关，往这里加卡片即可。')));
     }
 
+    /** 侧边栏底部常驻代理状态徽标：圆点 + 简短状态，点击弹出详情 */
+    function ProxyStatusBadge(props) {
+      const wide = props.wide !== false;
+      const store = useProxyStatus();
+      const state = store.state;
+
+      useEffect(() => acquireProxyPolling(), []);
+
+      const running = Boolean(state && state.running);
+      const enabled = Boolean(state && state.enabled);
+      const color = store.error ? '#c0392b' : running ? '#1e8449' : enabled ? '#c28b30' : 'rgba(128,128,128,0.6)';
+      const label = store.error ? '代理状态未知'
+        : !state ? '读取中…'
+          : running ? (state.current || '代理运行中')
+            : enabled ? '内核未启动'
+              : '代理已关闭';
+      const detail = '代理：' + label
+        + (state && state.delay ? '（' + state.delay + 'ms）' : '')
+        + (state && state.port ? '（端口 ' + state.port + '）' : '');
+
+      return el('button', {
+        type: 'button',
+        title: detail + '，点击查看详情',
+        'aria-expanded': store.popover ? 'true' : 'false',
+        onClick: (event) => {
+          event.stopPropagation();
+          void refreshProxyStatus();
+          publishProxy({ popover: !proxySnapshot.popover, message: '', tone: 'note' });
+        },
+        style: {
+          display: 'flex', alignItems: 'center', gap: 8, flex: '1 1 auto',
+          minWidth: 0, width: wide ? '100%' : 'auto', padding: wide ? '6px 10px' : '6px', margin: 0,
+          background: 'transparent', border: 'none', borderRadius: 8, cursor: 'pointer',
+          color: 'inherit', fontSize: 12, textAlign: 'left', justifyContent: wide ? 'flex-start' : 'center',
+        },
+      },
+        el('span', {
+          'aria-hidden': 'true',
+          style: {
+            width: 8, height: 8, flex: '0 0 auto', borderRadius: 4, background: color,
+            boxShadow: running ? '0 0 0 3px rgba(30,132,73,0.16)' : 'none',
+            transition: 'background .2s',
+          },
+        }),
+        wide ? el('span', {
+          style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.85 },
+        }, label) : null);
+    }
+
+    /** 徽标弹层：状态明细 + 测试延迟并刷新节点 / 停止内核；渲染在 shell.overlay 里 */
+    function ProxyStatusPopover() {
+      const store = useProxyStatus();
+      if (!store.popover) return null;
+      const state = store.state;
+      const running = Boolean(state && state.running);
+      const close = () => publishProxy({ popover: false, message: '', tone: 'note' });
+
+      async function act(routePath) {
+        const isEnsure = routePath === '/proxy/ensure';
+        publishProxy({
+          busy: routePath,
+          message: isEnsure ? '刷新订阅并测速中，最多十几秒…' : '正在停止内核…',
+          tone: 'note',
+        });
+        try {
+          const response = await fetch(API + routePath, isEnsure
+            ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ force: true }) }
+            : { method: 'POST' });
+          const data = await response.json();
+          if (!data.ok) throw new Error(data.error || 'HTTP ' + response.status);
+          if (isEnsure) {
+            publishProxy({
+              message: (data.refreshed ? '订阅已刷新 · ' : '') + '连通：' + data.region + ' / ' + data.node + '（' + data.delay + 'ms，共 ' + data.nodes + ' 个节点）',
+              tone: 'ok',
+            });
+          } else {
+            publishProxy({ message: '已停止内核', tone: 'note' });
+          }
+        } catch (error) {
+          publishProxy({ message: '操作失败：' + (error && error.message ? error.message : error), tone: 'warn' });
+        }
+        publishProxy({ busy: '' });
+        await refreshProxyStatus();
+      }
+
+      const rows = [
+        ['开关', state ? (state.enabled ? '已授权' : '已关闭') : '读取中…'],
+        ['内核', running ? '运行中' + (state.version ? ' · v' + state.version : '') : '未运行'],
+        ['端口', state && state.port ? String(state.port) : '—'],
+        ['当前节点', state && state.current ? state.current : '—'],
+        ['延迟', state && state.delay ? state.delay + ' ms' : '—'],
+        ['已运行', running && state.startedAt ? durationText(Date.now() - state.startedAt) : '—'],
+        ['偏好', state && state.regions && state.regions.length ? state.regions.join(' → ') : '未设置（全部节点取最低）'],
+        ['订阅更新', state && state.providerUpdatedAt ? timeAgo(state.providerUpdatedAt) : '未拉取'],
+        ['上次选节点', state && state.lastPick ? timeAgo(state.lastPick.at) + ' · ' + state.lastPick.node : '无记录'],
+      ];
+
+      return el('div', { style: { position: 'absolute', inset: 0 } },
+        el('div', { onClick: close, style: { position: 'absolute', inset: 0 } }),
+        el('div', {
+          role: 'dialog',
+          'aria-label': '代理状态',
+          onClick: (event) => event.stopPropagation(),
+          style: {
+            position: 'absolute', left: 12, bottom: 12, width: 320, maxWidth: 'calc(100vw - 24px)',
+            background: 'var(--dsw-alias-background-primary, #fff)', color: 'var(--dsw-alias-label-primary, #222)',
+            border: '1px solid rgba(128,128,128,0.3)', borderRadius: 12, padding: 14, fontSize: 13,
+            boxShadow: '0 10px 36px rgba(0,0,0,0.24)',
+          },
+        },
+          el('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
+            el('strong', { style: { fontSize: 13 } }, '代理状态'),
+            el('button', { type: 'button', style: { ...S.btn, padding: '3px 8px', fontSize: 12 }, onClick: close }, '关闭')),
+          el('div', { style: { marginTop: 10, display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '4px 10px' } },
+            rows.flatMap(([label, value]) => [
+              el('span', { key: 'l-' + label, style: { opacity: 0.6, whiteSpace: 'nowrap' } }, label),
+              el('span', { key: 'v-' + label, style: { wordBreak: 'break-all' } }, value),
+            ])),
+          store.error ? el('div', { style: { ...S.warn, marginTop: 8 } }, '读取失败：' + store.error) : null,
+          store.message ? el('div', {
+            style: {
+              marginTop: 8, fontSize: 12,
+              color: store.tone === 'warn' ? '#c0392b' : store.tone === 'ok' ? '#1e8449' : 'inherit',
+              opacity: store.tone === 'note' ? 0.7 : 1,
+            },
+          }, store.message) : null,
+          el('div', { style: { display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' } },
+            el('button', { type: 'button', style: S.btn, disabled: Boolean(store.busy) || !(state && state.enabled),
+              onClick: () => { void act('/proxy/ensure'); } }, store.busy === '/proxy/ensure' ? '刷新中…' : '测试延迟并刷新节点'),
+            el('button', { type: 'button', style: S.btn, disabled: Boolean(store.busy) || !running,
+              onClick: () => { void act('/proxy/stop'); } }, '停止内核'),
+            el('button', { type: 'button', style: S.btn, disabled: Boolean(store.busy),
+              onClick: () => { void refreshProxyStatus(); } }, '刷新')),
+          el('div', { style: { ...S.note, marginTop: 8 } }, '每 20 秒自动刷新；完整设置在「设置 → LQ配置 → 自动代理工具」。')));
+    }
+
+    /** 输入框下方统计行里的代理状态胶囊（🟢 代理中 / 🟡 未代理 / 🔴 故障），点击打开 LQ配置 */
+    function ProxyDockPill() {
+      const store = useProxyStatus();
+      const [hover, setHover] = useState(false);
+      useEffect(() => acquireProxyPolling(), []);
+      const state = store.state;
+      // 首次读数还没到就先不占位，避免闪一下「未代理」
+      if (!state && !store.error) return null;
+      const running = Boolean(state && state.running);
+      const enabled = Boolean(state && state.enabled);
+      const failed = Boolean(store.error) || (running && !state.current);
+      const dot = failed ? '🔴' : running ? '🟢' : '🟡';
+      const text = failed ? '故障' : running ? '代理中' : '未代理';
+      const detail = failed
+        ? (store.error || '内核在跑，但没读到当前节点')
+        : running
+          ? '节点 ' + (state.current || '—')
+            + (state.delay ? ' · ' + state.delay + ' ms' : '')
+            + (state.port ? ' · 端口 ' + state.port : '')
+          : enabled ? '开关已授权，内核还没启动（按需拉起）' : '代理开关已关闭';
+
+      return el('button', {
+        type: 'button',
+        'data-composer-stat': 'proxy',
+        title: text + '：' + detail + '｜点击打开 设置 → LQ配置',
+        'aria-label': '代理状态：' + text + '，点击打开 LQ配置',
+        onClick: () => { openLqSettings(); },
+        onMouseEnter: () => setHover(true),
+        onMouseLeave: () => setHover(false),
+        style: {
+          display: 'inline-flex', alignItems: 'center', gap: 6,
+          fontSize: 'calc(var(--dsh-content-font-size-secondary, 13px) - 1px)',
+          lineHeight: 'calc(20px + var(--dsh-content-font-delta-secondary, 0px))',
+          color: hover ? 'var(--dsw-alias-label-secondary)' : 'var(--dsw-alias-label-tertiary)',
+          background: hover ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
+          border: 'none', borderRadius: 'var(--dsw-radius-sm, 6px)',
+          padding: '1px 8px', cursor: 'pointer', whiteSpace: 'nowrap',
+          fontFamily: 'inherit', fontVariantNumeric: 'tabular-nums',
+        },
+      },
+        el('span', { 'aria-hidden': 'true', style: { fontSize: 11, lineHeight: '14px' } }, dot),
+        el('span', null, text));
+    }
+
     function apply(ctx) {
       ctx.effect(() => installNativeOpening(ctx), 'dsh-lqconfig: native opening');
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({
         name: 'shell.overlay', id: 'dsh-lqconfig.native-open-notice', order: 90,
       }, NativeOpenNotice));
+      ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+        name: 'shell.overlay', id: 'dsh-lqconfig.proxy-status', order: 91,
+      }, ProxyStatusPopover));
+      ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
+        name: 'sidebar.footer.action', id: 'dsh-lqconfig.proxy-badge', order: 90,
+      }, ProxyStatusBadge));
+      // 统计行里的「🟢 代理中」胶囊已按用户要求移除；ProxyDockPill 函数保留未用。
+      // 需要恢复时解除下面三行注释：
+      // ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+      //   name: 'conversation.composer.dock', id: 'dsh-lqconfig.proxy-pill', order: 2,
+      // }, ProxyDockPill));
       ctx.slots.inject('settings.section', function* () {
         yield ctx.slots.register(
           { name: 'settings.section', id: 'dsh-lqconfig', order: 40, label: () => 'LQ配置' },

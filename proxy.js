@@ -25,6 +25,7 @@ const DATA = path.join(HERE, 'proxy-data');
 const CONFIG = path.join(DATA, 'config.yaml');
 const PROVIDER = path.join(DATA, 'providers', 'zhuiyun.yaml');
 const PID_FILE = path.join(DATA, 'mihomo.pid');
+const LAST_PICK = path.join(DATA, 'last-pick.json');
 const SETTINGS = path.join(HERE, 'proxy.json');
 
 const UA = 'clash-verge/v2.5.5';
@@ -325,19 +326,47 @@ export async function stop() {
   return { running: await portOpen(settings.port) };
 }
 
+/** 上次 ensure 选中的节点（跨进程可读，供状态界面显示） */
+async function readLastPick() {
+  try {
+    const text = await fs.readFile(LAST_PICK, 'utf8');
+    const data = JSON.parse(text.replace(/^\uFEFF/, ''));
+    if (data && typeof data.at === 'number' && data.node) return data;
+  } catch { /* 还没有记录 */ }
+  return null;
+}
+
+async function writeLastPick(pick) {
+  try {
+    await fs.mkdir(DATA, { recursive: true });
+    await fs.writeFile(LAST_PICK, JSON.stringify(pick) + '\n', 'utf8');
+  } catch { /* 只是显示用，失败不影响代理 */ }
+}
+
 export async function status() {
   const settings = await readSettings();
   const running = (await portOpen(settings.port)) && (await portOpen(settings.apiPort));
   let current = null;
   let version = null;
+  let delay = null;
+  let startedAt = null;
   if (running) {
+    try { startedAt = (await fs.stat(PID_FILE)).mtimeMs; } catch { startedAt = null; }
     try {
       const data = await (await api(settings, '/proxies')).json();
       current = data.proxies && data.proxies[GROUP] ? data.proxies[GROUP].now : null;
       const info = await (await api(settings, '/version')).json();
       version = info.version || null;
     } catch { /* 内核启动中或正在退出 */ }
+    if (current) {
+      try {
+        const hit = (await providerNodes(settings)).find((node) => node.name === current);
+        if (hit && typeof hit.delay === 'number' && hit.delay > 0) delay = hit.delay;
+      } catch { delay = null; }
+    }
   }
+  let providerUpdatedAt = null;
+  try { providerUpdatedAt = (await fs.stat(PROVIDER)).mtimeMs; } catch { providerUpdatedAt = null; }
   return {
     enabled: settings.enabled,
     running,
@@ -348,6 +377,10 @@ export async function status() {
     hasUrl: Boolean(settings.url),
     current,
     version,
+    delay,
+    startedAt,
+    providerUpdatedAt,
+    lastPick: await readLastPick(),
   };
 }
 
@@ -418,18 +451,21 @@ export async function pickAndSwitch(settingsOverride) {
       body: JSON.stringify({ name: best.name }),
     });
     if (!response.ok) throw new Error('切换节点失败：HTTP ' + response.status);
-    return { region: region || '全部', node: best.name, delay: best.delay };
+    const picked = { region: region || '全部', node: best.name, delay: best.delay, at: Date.now() };
+    await writeLastPick(picked);
+    return { region: picked.region, node: picked.node, delay: picked.delay };
   }
   throw new Error('偏好地区内没有可用节点' + (settings.regions.length ? '（偏好：' + settings.regions.join('、') + '）' : ''));
 }
 
-export async function ensure() {
+/** force=true 时跳过 mtime 判断、立刻重拉订阅（面板「测试延迟并刷新节点」用）；默认惰性刷新。 */
+export async function ensure(force = false) {
   const settings = await readSettings();
   if (!settings.enabled) throw new Error('代理开关未开启');
   if (!settings.url) throw new Error('机场链接为空');
   if (!existsSync(BIN)) throw new Error('找不到内核：' + BIN);
 
-  const { refreshed, entries } = await refreshProvider(settings, false);
+  const { refreshed, entries } = await refreshProvider(settings, force === true);
   await fs.mkdir(DATA, { recursive: true });
   await fs.mkdir(path.dirname(PROVIDER), { recursive: true });
   await fs.writeFile(CONFIG, configYaml(settings), 'utf8');

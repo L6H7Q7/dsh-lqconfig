@@ -548,7 +548,8 @@ export function apply(ctx) {
                 return sendJson(res, 200, { ok: true, ...(await proxy.status()) });
               }
               if (req.method === 'POST' && action === 'ensure') {
-                return sendJson(res, 200, { ok: true, ...(await proxy.ensure()) });
+                const body = await readBody(req);
+                return sendJson(res, 200, { ok: true, ...(await proxy.ensure(body && body.force === true)) });
               }
               if (req.method === 'POST' && action === 'stop') {
                 return sendJson(res, 200, { ok: true, ...(await proxy.stop()) });
