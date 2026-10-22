@@ -32,7 +32,7 @@ const ROW_NAME = '@deepseek-ai/dsh-llm-deepseek-api-key';
  * 实测依据：persona 是唯一落在系统提示里的注入点，比 AGENTS.md 的会话级指令权重更高。
  */
 const ZH_SUFFIX =
-  '内部思考过程默认使用简体中文表达；技术术语、代码标识符、API 与产品专有名词保留原文英文；除非没有通行中文译法，否则不要整句使用英文。';
+  '思考与回答默认简体中文，代码、命令、API 与产品名保留英文；除非没有通用中文译法，不要整句使用英文。';
 
 /** 只匹配 persona 块里 10 空格缩进的 suffix: ''，不碰别的 suffix */
 const PLAIN_SUFFIX_RE = /(\n {10}suffix: )''(?=\n)/g;
