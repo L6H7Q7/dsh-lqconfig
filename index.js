@@ -392,8 +392,9 @@ async function restartApp() {
   const exe = exePath();
   if (!existsSync(exe)) throw new Error('找不到应用可执行文件：' + exe);
 
-  // 用 VBS 以窗口样式 0 执行：计划任务拉起 wscript，cmd 全程隐藏；
-  // 任务本身不受 DSH 进程树（Job Object）影响，主进程被杀也不会连坐。
+  // 脚本方式：写 VBS 后直接由 wscript 执行，不注册计划任务。
+  // VBS 内容全 ASCII，避免 wscript 按 ANSI 读 UTF-8 中文时炸「无效字符」。
+  // 窗口样式 0 = 隐藏；延时 2 秒让 HTTP 响应先回到页面。
   const vbs = path.join(os.tmpdir(), 'dsh-lqconfig-restart.vbs');
   const lines = [
     'Set sh = CreateObject("WScript.Shell")',
@@ -404,19 +405,10 @@ async function restartApp() {
   ];
   await fs.writeFile(vbs, lines.join('\r\n'), 'utf8');
 
-  const task = 'dsh-lqconfig-restart';
-  const { execFile } = await import('node:child_process');
-  const run = (args) =>
-    new Promise((resolve, reject) => {
-      execFile('schtasks', args, { windowsHide: true }, (error, stdout, stderr) => {
-        if (error) reject(new Error((stderr || stdout || error.message).trim()));
-        else resolve((stdout || '').trim());
-      });
-    });
-
-  await run(['/create', '/f', '/tn', task, '/tr', 'wscript.exe //B ' + vbs, '/sc', 'once', '/st', '23:59']);
-  await run(['/run', '/tn', task]);
-  return { exe, task, vbs };
+  const { spawn } = await import('node:child_process');
+  const child = spawn('wscript.exe', ['//B', vbs], { detached: true, stdio: 'ignore', windowsHide: true });
+  child.unref();
+  return { exe, vbs, pid: child.pid };
 }
 
 function sendJson(res, status, obj) {
@@ -520,6 +512,7 @@ export function apply(ctx) {
                 if (typeof body.url === 'string') patch.url = body.url;
                 if (Array.isArray(body.regions)) patch.regions = body.regions;
                 if (typeof body.port === 'number') patch.port = body.port;
+                if (typeof body.refreshMinutes === 'number') patch.refreshMinutes = body.refreshMinutes;
                 const settings = await proxy.writeSettings(patch);
                 if (settings.enabled === false) await proxy.stop();
                 return sendJson(res, 200, { ok: true, ...(await proxy.status()) });
