@@ -329,6 +329,8 @@ window.__ModuleLoader__.load({
     function ProxyCard() {
       const [state, setState] = useState({ hasUrl: false, enabled: false, running: false, current: '', version: '', port: 0, host: '' });
       const [urlInput, setUrlInput] = useState('');
+      const [portInput, setPortInput] = useState('');
+      const [refreshInput, setRefreshInput] = useState('');
       const [regions, setRegions] = useState([]);
       const [available, setAvailable] = useState([]);
       const [busy, setBusy] = useState('');
@@ -349,6 +351,8 @@ window.__ModuleLoader__.load({
           const data = await call('/proxy/state');
           setState(data);
           setRegions(Array.isArray(data.regions) ? data.regions : []);
+          setPortInput(data.port ? String(data.port) : '');
+          setRefreshInput(data.refreshMinutes ? String(data.refreshMinutes) : '');
         } catch (error) {
           setTone('warn');
           setMessage('读取失败：' + String(error && error.message ? error.message : error));
@@ -400,14 +404,11 @@ window.__ModuleLoader__.load({
         try {
           await call('/proxy/set', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled: next }) });
           if (next) {
-            setTone('note');
-            setMessage('内核启动中，正在按偏好测速选节点…');
-            const result = await call('/proxy/ensure', { method: 'POST' });
             setTone('ok');
-            setMessage('已启动：' + result.region + ' / ' + result.node + '（' + result.delay + 'ms）');
+            setMessage('已允许 DSH 按需使用代理。内核不会现在启动，等真正需要时或点「测试并选节点」才拉起。');
           } else {
             setTone('note');
-            setMessage('已停止');
+            setMessage('已禁止使用代理，已停止内核');
           }
           await load();
         } catch (error) {
@@ -437,6 +438,25 @@ window.__ModuleLoader__.load({
         setBusy('');
       }
 
+      async function saveTuning() {
+        const port = Number(portInput);
+        const refresh = Number(refreshInput);
+        if (!Number.isInteger(port) || port < 1 || port > 65535) { setTone('warn'); setMessage('端口需在 1–65535 之间'); return; }
+        if (!Number.isInteger(refresh) || refresh < 1) { setTone('warn'); setMessage('订阅刷新需为正整数（分钟）'); return; }
+        setBusy('tuning');
+        setMessage('');
+        try {
+          await call('/proxy/set', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ port, refreshMinutes: refresh }) });
+          setTone('ok');
+          setMessage('已保存：端口 ' + port + '，订阅刷新 ' + refresh + ' 分钟');
+          await load();
+        } catch (error) {
+          setTone('warn');
+          setMessage('保存失败：' + String(error && error.message ? error.message : error));
+        }
+        setBusy('');
+      }
+
       async function test() {
         setBusy('test');
         setMessage('测速中，最多十秒…');
@@ -455,14 +475,14 @@ window.__ModuleLoader__.load({
 
       return el('div', { style: S.card },
         el('div', { style: S.head },
-          el('div', { style: S.title }, '代理（机场）'),
+          el('div', { style: S.title }, '自动代理工具'),
           el(Switch, {
             checked: state.enabled,
             disabled: busy !== '' || !state.hasUrl,
-            label: '代理开关',
+            label: '自动代理',
             onChange: (event) => { void toggle(event.target.checked); },
           })),
-        el('div', { style: S.desc }, '填入机场订阅链接后开关才可用。开启后由内置 mihomo 内核按偏好地区挑延迟最低的节点；模型需要外网时按需拉起，关闭即停内核。'),
+        el('div', { style: S.desc }, '开启后，DSH 可以在需要时通过本插件自动切换代理、使用代理；关闭后禁止使用。开关只是授权，不会立刻启动内核——真正需要时（或点下方「测试并选节点」）才拉起。开关需要先填好机场链接。'),
         el('div', { style: { display: 'flex', gap: 8, marginTop: 12 } },
           el('input', {
             type: 'text',
@@ -472,6 +492,21 @@ window.__ModuleLoader__.load({
             style: { flex: 1, minWidth: 0, padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: 13 },
           }),
           el('button', { style: S.btn, onClick: () => { void saveUrl(); } }, '保存链接')),
+        el('div', { style: { display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' } },
+          el('span', { style: { fontSize: 12, opacity: 0.7 } }, '端口'),
+          el('input', {
+            type: 'number', value: portInput, min: 1, max: 65535,
+            onChange: (event) => setPortInput(event.target.value),
+            style: { width: 80, padding: '5px 8px', borderRadius: 8, border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: 13 },
+          }),
+          el('span', { style: { fontSize: 12, opacity: 0.7, marginLeft: 6 } }, '订阅刷新（分钟）'),
+          el('input', {
+            type: 'number', value: refreshInput, min: 1,
+            onChange: (event) => setRefreshInput(event.target.value),
+            style: { width: 80, padding: '5px 8px', borderRadius: 8, border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: 13 },
+          }),
+          el('button', { style: S.btn, onClick: () => { void saveTuning(); } }, '保存'),
+          el('span', { style: S.note }, '改端口要关开关重开才生效；刷新时间下次拉订阅时生效')),
         el('div', { style: S.status },
           '状态：' + (state.running ? '运行中 · ' + state.current : '未运行')
           + (state.version ? ' · 内核 ' + state.version : '')
