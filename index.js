@@ -11,7 +11,7 @@
  * 路由前缀：/dsh-lqconfig/api/*（同源 HTTP，供设置页「LQ配置」使用）
  */
 import { promises as fs } from 'node:fs';
-import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, writeFileSync, unlinkSync, appendFileSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
@@ -36,8 +36,8 @@ const ROW_NAME = '@deepseek-ai/dsh-llm-deepseek-api-key';
 const ZH_SUFFIX =
   '思考与回答默认简体中文，代码、命令、API 与产品名保留英文；除非没有通用中文译法，不要整句使用英文。';
 
-/** 只匹配 persona 块里 10 空格缩进的 suffix: ''，不碰别的 suffix */
-const PLAIN_SUFFIX_RE = /(\n {10}suffix: )''(?=\n)/g;
+/** 匹配 persona 块里 10 空格缩进的 prefix 行（中文约束挂在 prefix 上，不重复写 suffix） */
+const PERSONA_PREFIX_LINE_RE = /^ {10}prefix: .*$/gm;
 
 function dshHome() {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
@@ -49,6 +49,47 @@ function patchPath() {
 
 function exePath() {
   return process.env.DSH_DESKTOP_EXE || 'D:\\AI\\Agent\\DeepSeek Harness\\DeepSeek Harness.exe';
+}
+
+/** 官方桌面包的密封归档。它在的时候宿主加载的是它，而不是 resources\app。 */
+function asarPath() {
+  return path.join(path.dirname(exePath()), 'resources', 'app.asar');
+}
+
+/** 桌面宿主才做「杀进程 + 拉 exe」，网页/无头宿主没有这条链路。 */
+function desktopRestartAvailable() {
+  return process.platform === 'win32' && existsSync(exePath());
+}
+
+const DIAG_LOG = path.join(process.env.TEMP || os.tmpdir(), 'dsh-lqconfig-diag.log');
+
+/** 重启决策写盘：出问题直接看这一行，不用猜。 */
+function diag(event, data) {
+  try {
+    const payload = data === undefined ? '' : ' ' + JSON.stringify(data);
+    appendFileSync(DIAG_LOG, new Date().toISOString() + ' ' + event + payload + '\n');
+  } catch { /* 日志写不进去不该影响重启 */ }
+}
+
+/** 自动重启的防循环戳：同一份 app.asar 十分钟内只自动重启一次。 */
+function autoRestartStampPath() {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), '.auto-restart.json');
+}
+
+function asarIdentity() {
+  try {
+    const stat = statSync(asarPath());
+    return { size: stat.size, mtimeMs: Math.round(stat.mtimeMs) };
+  } catch { return null; }
+}
+
+async function fetchPurgeStatus() {
+  if (!localPort) return null;
+  try {
+    const res = await fetch('http://127.0.0.1:' + localPort + '/dsh-purge/status');
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
 }
 
 function disabledBlock() {
@@ -200,8 +241,105 @@ export async function readNativeSettings() {
 
 export async function writeNativeSettings(enabled) {
   if (typeof enabled !== 'boolean') throw new Error('enabled 必须是布尔值');
-  await fs.writeFile(nativeStatePath, JSON.stringify({ openNative: enabled }, null, 2) + '\n', 'utf8');
+  const current = await readStateFile();
+  current.openNative = enabled;
+  await fs.writeFile(nativeStatePath, JSON.stringify(current, null, 2) + '\n', 'utf8');
   return { openNative: enabled };
+}
+
+// 原始 state.json 内容（合并写入用，避免两个开关互相清除对方的键）
+async function readStateFile() {
+  try {
+    const text = await fs.readFile(nativeStatePath, 'utf8');
+    const value = JSON.parse(text.replace(/^\uFEFF/, ''));
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+// 左下角余额徽标开关：默认开启；state.json 里缺键时也视为开启
+export async function readBalanceBadge() {
+  const value = await readStateFile();
+  return typeof value.balanceBadge === 'boolean' ? value.balanceBadge : true;
+}
+
+export async function writeBalanceBadge(enabled) {
+  if (typeof enabled !== 'boolean') throw new Error('enabled 必须是布尔值');
+  const current = await readStateFile();
+  current.balanceBadge = enabled;
+  await fs.writeFile(nativeStatePath, JSON.stringify(current, null, 2) + '\n', 'utf8');
+  return { balanceBadge: enabled };
+}
+
+// 余额轮询间隔（分钟）：1–60；缺键或非法值回落 1 分钟
+export async function readBalanceInterval() {
+  const value = await readStateFile();
+  const minutes = Number(value.balanceIntervalMinutes);
+  return Number.isFinite(minutes) && minutes >= 1 && minutes <= 60 ? Math.round(minutes) : 1;
+}
+
+export async function writeBalanceInterval(minutes) {
+  const value = Number(minutes);
+  if (!Number.isFinite(value) || value < 1 || value > 60) {
+    throw new Error('间隔必须是 1–60 之间的分钟数');
+  }
+  const rounded = Math.round(value);
+  const current = await readStateFile();
+  current.balanceIntervalMinutes = rounded;
+  await fs.writeFile(nativeStatePath, JSON.stringify(current, null, 2) + '\n', 'utf8');
+  return { balanceIntervalMinutes: rounded };
+}
+
+// 余额取数：调本插件自带的 scripts/balance.ps1 -Json（与手工排查同源）。
+// pwsh 只用 PATH 名，不硬编码 WindowsApps 下带版本号的绝对路径。
+const balanceScriptPath = fileURLToPath(new URL('./scripts/balance.ps1', import.meta.url));
+const BALANCE_CACHE_MS = 20_000;   // 20 秒内并发去重，降低平台请求频率
+const BALANCE_TIMEOUT_MS = 20_000;
+let balanceCache = { at: 0, data: null };
+
+export async function readBalance() {
+  const now = Date.now();
+  if (balanceCache.data && now - balanceCache.at < BALANCE_CACHE_MS) return balanceCache.data;
+
+  const result = await new Promise((resolve) => {
+    let settled = false;
+    const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+    let child;
+    try {
+      child = spawn('pwsh', ['-NoProfile', '-NonInteractive', '-File', balanceScriptPath, '-Json'], {
+        windowsHide: true,
+      });
+    } catch (error) {
+      return done({ ok: false, error: '无法启动 pwsh：' + error.message });
+    }
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* 尽力而为 */ }
+      done({ ok: false, error: '余额脚本超时（' + Math.round(BALANCE_TIMEOUT_MS / 1000) + ' 秒）' });
+    }, BALANCE_TIMEOUT_MS);
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      done({ ok: false, error: '无法启动 pwsh：' + error.message });
+    });
+    child.on('close', () => {
+      clearTimeout(timer);
+      const line = stdout.split(/\r?\n/u).map((item) => item.trim()).filter(Boolean).pop() || '';
+      try {
+        const data = JSON.parse(line);
+        if (data && data.ok) balanceCache = { at: Date.now(), data };
+        done(data);
+      } catch {
+        const hint = stderr.trim().split(/\r?\n/u).filter(Boolean).pop() || '余额脚本输出无法解析';
+        done({ ok: false, error: hint.slice(0, 300), raw: line.slice(0, 200) });
+      }
+    });
+  });
+
+  return result;
 }
 
 export function validateNativePath(value) {
@@ -450,9 +588,11 @@ export async function readState() {
   const text = exists ? await fs.readFile(file, 'utf8') : '';
   return {
     enabled: !text.includes(BLOCK_START),
-    chainZh: text.includes("suffix: '" + ZH_SUFFIX + "'"),
+    chainZh: text.includes(ZH_SUFFIX),
     purge: text.includes(PURGE_START),
     ...(await readNativeSettings()),
+    balanceBadge: await readBalanceBadge(),
+    balanceIntervalMinutes: await readBalanceInterval(),
     exists,
     patchPath: file,
     exe: exePath(),
@@ -489,8 +629,10 @@ export async function writeEnabled(enabled) {
 }
 
 /**
- * 开关「思维链优先中文」：只改 persona 的 suffix 一行，其余字符一律不动。
- * 打开 = suffix: '' → suffix: '<ZH_SUFFIX>'；关闭 = 反向还原成 ''。
+ * 开关「思维链优先中文」：把约束追加到 persona 的 prefix 行尾，其余字符一律不动。
+ * 打开 = 三个 preset 的 prefix 行尾追加一句；关闭 = 把那句删掉（兼容旧的 suffix 写法）。
+ * 选择 prefix 而不是 suffix：prefix 在提示前段（身份区），suffix 排在 order 10200 的最尾部，
+ * 长上下文里尾部约束更容易被稀释。
  */
 export async function writeChainZh(enabled) {
   const file = patchPath();
@@ -498,12 +640,12 @@ export async function writeChainZh(enabled) {
 
   const text = await fs.readFile(file, 'utf8');
   const next = enabled
-    ? text.replace(PLAIN_SUFFIX_RE, (_match, head) => head + "'" + ZH_SUFFIX + "'")
-    : text.split("suffix: '" + ZH_SUFFIX + "'").join("suffix: ''");
+    ? text.replace(PERSONA_PREFIX_LINE_RE, (match) => (match.includes(ZH_SUFFIX) ? match : match + ' ' + ZH_SUFFIX))
+    : text.split(' ' + ZH_SUFFIX).join('').split("'" + ZH_SUFFIX + "'").join("''");
 
   if (next === text) return { changed: false, backup: null };
   if (enabled && !next.includes(ZH_SUFFIX)) {
-    throw new Error('补丁里没找到 persona 的 suffix，未做任何改动');
+    throw new Error('补丁里没找到 persona 的 prefix 行，未做任何改动');
   }
 
   const bak = file + '.bak-lqconfig-' + stamp();
@@ -512,7 +654,7 @@ export async function writeChainZh(enabled) {
   return { changed: true, backup: bak };
 }
 
-async function restartApp() {
+async function restartApp(options = {}) {
   const exe = exePath();
   if (!existsSync(exe)) throw new Error('找不到应用可执行文件：' + exe);
 
@@ -522,7 +664,12 @@ async function restartApp() {
   // 手动点 restart-dsh.vbs 正常，是因为它由 explorer 拉起，环境干净。
   // 现在交给独立助手进程：它自己以 Node 模式跑，拉起 EXE 前把变量洗掉。
   const helper = fileURLToPath(new URL('./restart-helper.mjs', import.meta.url));
-  const child = spawn(process.execPath, [helper, exe], {
+  const args = [helper, exe];
+  // 超限模式打完补丁后，补丁在 resources\app，宿主还在读 resources\app.asar：
+  // 这一次重启顺手把 asar 挪成 .bak，下次启动加载的就是打过补丁的 resources\app。
+  const swapAsar = options.swapAsar === true;
+  if (swapAsar) args.push('--swap-asar=' + asarPath());
+  const child = spawn(process.execPath, args, {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
@@ -530,7 +677,7 @@ async function restartApp() {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
   });
   child.unref();
-  return { exe, helper, pid: child.pid };
+  return { exe, helper, pid: child.pid, swapAsar };
 }
 
 function sendJson(res, status, obj) {
@@ -560,15 +707,49 @@ export function apply(ctx) {
 
   try { localPort = Number(ctx.webServer?.port) || 0; } catch { localPort = 0; }
 
+  // 统一重启入口：超限模式（dsh-purge）的「现在重启」也调这里，
+  // 不再让 purge 自己那套 wscript / PowerShell / restart-desktop 各玩各的。
+  if (desktopRestartAvailable()) {
+    try {
+      globalThis.__dshLqRestart = (options) => restartApp(options || {});
+      ctx.effect(() => () => { try { delete globalThis.__dshLqRestart; } catch { /* 忽略 */ } }, 'dsh-lqconfig: restart hook');
+    } catch { /* 没有全局对象也不影响自带面板 */ }
+  }
+
   // 超限模式第二阶段：开关是把「挂载」写进 profile 的，插件要重启后才在进程里，
-  // 所以补丁只能在这次启动后由这里调它自己的 /dsh-purge/apply。带重试，成功后清标记。
+  // 所以补丁只能在这次启动后由这里调它自己的 /dsh-purge/apply。
+  // 打完补丁必须重启才生效——这一次就是「启动时唯一的重启」，顺手把 app.asar 换掉，
+  // 不再留着让面板弹「要现在重启吗」补第二次。
   if (hasPurgePending()) {
     const timer = setTimeout(async () => {
       for (let attempt = 0; attempt < 20; attempt += 1) {
         const result = await callPurgeRoute('/dsh-purge/apply');
         if (result.ok) {
           markPurgePending(false);
-          try { ctx.logger?.info?.('[dsh-lqconfig] 超限模式补丁已应用'); } catch { /* 忽略 */ }
+          const data = result.data && typeof result.data === 'object' ? result.data : {};
+          // complete 会因为 pattern_not_found 这类"不阻断"的失败变成 false（purge 自己
+          // 也是这么设计的：promptReady 仍然允许重启）。所以这里只把真正阻断的失败算进去，
+          // 否则就会出现「补丁已写盘、却永远不重启」，又退回弹窗让用户手点。
+          const failedItems = Array.isArray(data.failed_items) ? data.failed_items : [];
+          const blocking = failedItems.filter((item) => item && item.status && item.status !== 'pattern_not_found').length;
+          const settled = data.ok !== false && blocking === 0;
+          const swapAsar = settled && data.asar_still_sealed === true;
+          const wantRestart = settled && (swapAsar || data.restarting === true || data.needs_full_quit === true);
+          diag('apply.result', {
+            ok: data.ok, complete: data.complete, restarting: data.restarting,
+            needs_full_quit: data.needs_full_quit, asar_still_sealed: data.asar_still_sealed,
+            applied: data.applied, already: data.already, failed: data.failed,
+            blocking, settled, swapAsar, wantRestart,
+          });
+          if (wantRestart) {
+            await new Promise((resolve) => { const t = setTimeout(resolve, 1500); t.unref?.(); });
+            diag('apply.restart', { swapAsar });
+            try {
+              await restartApp({ swapAsar });
+            } catch (error) {
+              diag('apply.restart.error', { error: String(error && error.message ? error.message : error) });
+            }
+          }
           return;
         }
         await new Promise((resolve) => { const t = setTimeout(resolve, 3000); t.unref?.(); });
@@ -578,6 +759,49 @@ export function apply(ctx) {
     timer.unref?.();
     ctx.effect(() => () => clearTimeout(timer), 'dsh-lqconfig: purge apply');
   }
+
+  // 兜底自愈：若这次启动后 purge 仍挂着 boot_full_quit（补丁在 resources\app、
+  // 但宿主还在读 app.asar），就直接把这一次"换包重启"做掉，不再留给面板弹窗让用户点。
+  // 走 purge 自己的 /dsh-purge/restart（它用 ensureRestartReady 把关），而该路由已经
+  // 优先转给本插件的 __dshLqRestart，所以执行端始终是同一个 helper。
+  // 防循环：同一份 asar 十分钟内只自动重启一次；换包成功后 asar 不在了，条件自然消失。
+  // 紧急停用：这个自愈在 asar 状态判断失灵时会变成"每 20 秒重启一次"。
+  // 默认关闭，只有显式设了 LQC_AUTO_HEAL=1 才跑。
+  const healTimer = process.env.LQC_AUTO_HEAL === '1' ? setTimeout(async () => {
+    if (!desktopRestartAvailable() || hasPurgePending()) return;
+    try {
+      const status = await fetchPurgeStatus();
+      if (!status) return;
+      // 条件不是只看 boot_full_quit：补丁已经写进 resources\app、asar 还在，
+      // 这两种情形都意味着"宿主还在跑旧包"，那就该换包重启一次。
+      const sealed = status.asar_still_sealed === true;
+      const appliedCount = Number(status.patches_applied) || 0;
+      if (!sealed || appliedCount <= 0) {
+        diag('heal.skip', { reason: sealed ? 'no-patches' : 'unsealed', appliedCount, bootFullQuit: status.boot_full_quit });
+        return;
+      }
+      const identity = asarIdentity();
+      if (!identity) {
+        diag('heal.skip', { reason: 'no-asar' });
+        return;
+      }
+      let stamp = null;
+      try { stamp = JSON.parse(readFileSync(autoRestartStampPath(), 'utf8')); } catch { stamp = null; }
+      const sameAsar = stamp && stamp.size === identity.size && stamp.mtimeMs === identity.mtimeMs;
+      if (sameAsar && Date.now() - Number(stamp.at || 0) < 10 * 60 * 1000) {
+        diag('heal.skip', { reason: 'recent', identity });
+        return;
+      }
+      writeFileSync(autoRestartStampPath(), JSON.stringify({ at: Date.now(), ...identity }), 'utf8');
+      diag('heal.restart', { identity });
+      const planned = await callPurgeRoute('/dsh-purge/restart');
+      diag('heal.result', planned && planned.data ? planned.data : { ok: planned.ok, error: planned.error });
+    } catch (error) {
+      diag('heal.error', { error: String(error && error.message ? error.message : error) });
+    }
+  }, 14000) : null;
+  healTimer?.unref?.();
+  ctx.effect(() => () => clearTimeout(healTimer), 'dsh-lqconfig: restart self heal');
 
   // 开关打开时，启动后自动预热内核；不阻塞 apply，失败只记日志
   let warmupTimer = setTimeout(() => {
@@ -609,6 +833,27 @@ export function apply(ctx) {
             if (req.method === 'GET' && route === '/api/state') {
               return sendJson(res, 200, { ok: true, ...(await readState()) });
             }
+            if (req.method === 'GET' && route === '/api/balance') {
+              return sendJson(res, 200, await readBalance());
+            }
+            if (req.method === 'POST' && route === '/api/balance-enabled') {
+              const body = await readBody(req);
+              if (typeof body.enabled !== 'boolean') {
+                return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+              }
+              return sendJson(res, 200, { ok: true, ...(await writeBalanceBadge(body.enabled)) });
+            }
+            if (req.method === 'POST' && route === '/api/balance-interval') {
+              const body = await readBody(req);
+              try {
+                return sendJson(res, 200, { ok: true, ...(await writeBalanceInterval(body.minutes)) });
+              } catch (error) {
+                return sendJson(res, 400, {
+                  ok: false,
+                  error: String(error && error.message ? error.message : error),
+                });
+              }
+            }
             if (req.method === 'POST' && route === '/api/set') {
               const body = await readBody(req);
               if (typeof body.enabled !== 'boolean') {
@@ -624,27 +869,6 @@ export function apply(ctx) {
               }
               const result = await writeChainZh(body.enabled);
               return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
-            }
-            if (req.method === 'POST' && route === '/api/purge') {
-              const body = await readBody(req);
-              if (typeof body.on !== 'boolean') {
-                return sendJson(res, 400, { ok: false, error: 'on 必须是布尔值' });
-              }
-              if (body.on) {
-                // 开：先挂载（重启后插件才在进程里），打补丁交给重启后的第二阶段。
-                const result = await writePurgeMode(true);
-                markPurgePending(true);
-                return sendJson(res, 200, {
-                  ok: true, ...result, pending: true,
-                  note: '已写入挂载，重启后由插件自行解开 app.asar 并打补丁（可能再自动重启一次）。',
-                  ...(await readState()),
-                });
-              }
-              // 关：此刻插件还挂在进程里，先让它原地还原宿主补丁，再摘挂载。
-              const revert = await callPurgeRoute('/dsh-purge/revert');
-              markPurgePending(false);
-              const result = await writePurgeMode(false);
-              return sendJson(res, 200, { ok: true, ...result, revert, ...(await readState()) });
             }
             if (req.method === 'POST' && (route === '/api/native-setting' || route === '/api/native-open')) {
               if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) {
@@ -714,8 +938,22 @@ export function apply(ctx) {
               }
               return sendJson(res, 404, { ok: false, error: 'not found' });
             }
+            if (req.method === 'GET' && route === '/api/diag') {
+              let stamp = null;
+              try { stamp = JSON.parse(readFileSync(autoRestartStampPath(), 'utf8')); } catch { stamp = null; }
+              return sendJson(res, 200, {
+                ok: true,
+                purgePending: hasPurgePending(),
+                asar: asarIdentity(),
+                desktopRestart: desktopRestartAvailable(),
+                unifiedHook: typeof globalThis.__dshLqRestart === 'function',
+                lastAutoRestart: stamp,
+                diagLog: DIAG_LOG,
+              });
+            }
             if (req.method === 'POST' && route === '/api/restart') {
-              return sendJson(res, 200, { ok: true, ...(await restartApp()) });
+              const body = await readBody(req);
+              return sendJson(res, 200, { ok: true, ...(await restartApp({ swapAsar: body.swapAsar === true })) });
             }
             return sendJson(res, 404, { ok: false, error: 'not found' });
           } catch (error) {
@@ -726,3 +964,4 @@ export function apply(ctx) {
     'dsh-lqconfig: routes',
   );
 }
+

@@ -77,6 +77,134 @@ window.__ModuleLoader__.load({
       if (typeof document !== 'undefined' && !document.hidden) void refreshProxyStatus();
     }
 
+    /* ---------------- 余额徽标：左下角、代理上方，间隔可配（默认 1 分钟） ---------------- */
+    let balanceSnapshot = { data: null, error: '', at: 0, enabled: true, intervalMinutes: 1 };
+    const balanceSubscribers = new Set();
+    function publishBalance(patch) {
+      balanceSnapshot = { ...balanceSnapshot, ...patch };
+      for (const listener of [...balanceSubscribers]) listener();
+    }
+    function useBalance() {
+      return React.useSyncExternalStore(
+        React.useCallback((listener) => { balanceSubscribers.add(listener); return () => balanceSubscribers.delete(listener); }, []),
+        () => balanceSnapshot,
+      );
+    }
+    let balanceRequestId = 0;
+    /** 失败后 15 秒内重试一次，避免首次失败要干等 5 分钟轮询周期 */
+    let balanceRetryTimer = null;
+    function scheduleBalanceRetry() {
+      if (balanceRetryTimer !== null) return;
+      balanceRetryTimer = setTimeout(() => {
+        balanceRetryTimer = null;
+        void refreshBalance();
+      }, 15000);
+    }
+    function clearBalanceRetry() {
+      if (balanceRetryTimer === null) return;
+      clearTimeout(balanceRetryTimer);
+      balanceRetryTimer = null;
+    }
+    async function refreshBalance(force) {
+      if (!balanceSnapshot.enabled && !force) return;
+      const id = ++balanceRequestId;
+      try {
+        const response = await fetch(API + '/balance', { cache: 'no-store' });
+        const data = await response.json();
+        if (id !== balanceRequestId) return;
+        if (data && data.ok) {
+          clearBalanceRetry();
+          publishBalance({ data, error: '', at: Date.now() });
+        } else {
+          publishBalance({ error: String((data && data.error) || ('HTTP ' + response.status)) });
+          scheduleBalanceRetry();
+        }
+      } catch (error) {
+        if (id === balanceRequestId) {
+          publishBalance({ error: String(error && error.message ? error.message : error) });
+          scheduleBalanceRetry();
+        }
+      }
+    }
+    let balancePollTimer = null;
+    let balancePollUsers = 0;
+    function balanceTick() {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      void refreshBalance();
+    }
+    /** 间隔以分钟计；重建定时器让新值立刻生效，不必等旧周期走完 */
+    function applyBalanceInterval(minutes) {
+      const parsed = Number(minutes);
+      const clamped = Math.min(60, Math.max(1, Number.isFinite(parsed) ? Math.round(parsed) : 1));
+      publishBalance({ intervalMinutes: clamped });
+      if (balancePollTimer !== null) {
+        clearInterval(balancePollTimer);
+        balancePollTimer = setInterval(balanceTick, clamped * 60000);
+      }
+      return clamped;
+    }
+    function onBalanceVisibility() {
+      if (typeof document !== 'undefined' && !document.hidden) void refreshBalance();
+    }
+    function acquireBalancePolling() {
+      balancePollUsers += 1;
+      if (balancePollTimer === null) {
+        void refreshBalance();
+        balancePollTimer = setInterval(balanceTick, (balanceSnapshot.intervalMinutes || 1) * 60000);
+        if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onBalanceVisibility);
+      }
+      return () => {
+        balancePollUsers -= 1;
+        if (balancePollUsers > 0 || balancePollTimer === null) return;
+        clearInterval(balancePollTimer);
+        balancePollTimer = null;
+        if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onBalanceVisibility);
+      };
+    }
+    /** 从宿主读一次开关与间隔初值；读不到时保持默认（开启 / 1 分钟） */
+    async function loadBalanceSettings() {
+      try {
+        const response = await fetch(API + '/state', { cache: 'no-store' });
+        const data = await response.json();
+        if (data && typeof data.balanceBadge === 'boolean') publishBalance({ enabled: data.balanceBadge });
+        if (data && Number.isFinite(Number(data.balanceIntervalMinutes))) {
+          publishBalance({ intervalMinutes: Number(data.balanceIntervalMinutes) });
+        }
+      } catch { /* 保持默认 */ }
+    }
+    /** 间隔落盘；失败按宿主给的提示回滚 */
+    async function saveBalanceInterval(minutes) {
+      try {
+        const response = await fetch(API + '/balance-interval', {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ minutes }),
+        });
+        const data = await response.json();
+        if (!data || !data.ok) throw new Error((data && data.error) || ('HTTP ' + response.status));
+        return { ok: true, minutes: applyBalanceInterval(data.balanceIntervalMinutes) };
+      } catch (error) {
+        return { ok: false, error: String(error && error.message ? error.message : error) };
+      }
+    }
+    /** 开关落盘；失败时回滚界面状态，避免「看起来关了其实还在轮询」 */
+    async function saveBalanceBadge(enabled) {
+      publishBalance({ enabled });
+      try {
+        const response = await fetch(API + '/balance-enabled', {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled }),
+        });
+        const data = await response.json();
+        if (!data || !data.ok) throw new Error((data && data.error) || ('HTTP ' + response.status));
+        publishBalance({ enabled: data.balanceBadge === true });
+        if (enabled) void refreshBalance();
+      } catch (error) {
+        publishBalance({
+          enabled: !enabled,
+          error: '保存余额开关失败：' + (error && error.message ? error.message : error),
+        });
+      }
+    }
+
+
     /**
      * 打开「设置 → LQ配置」。宿主没有对外暴露「打开设置 / 选中分区」的接口，
      * 只能在 DOM 层点：侧边栏设置按钮（_triggerRow 里的 aria-haspopup=dialog 按钮），
@@ -649,6 +777,74 @@ window.__ModuleLoader__.load({
         el('div', { style: S.mono }, '偏好：' + (regions.length ? regions.join(' → ') : '未设置（全部节点里选最低）')));
     }
 
+    /** 设置页卡片：左下角余额徽标的开关与现状 */
+    function BalanceCard() {
+      const store = useBalance();
+      const [busy, setBusy] = useState(false);
+      const [refreshing, setRefreshing] = useState(false);
+      const [intervalInput, setIntervalInput] = useState(String(store.intervalMinutes || 1));
+      const [intervalMsg, setIntervalMsg] = useState('');
+      const [intervalTone, setIntervalTone] = useState('note');
+      const data = store.data;
+
+      useEffect(() => {
+        setIntervalInput(String(store.intervalMinutes || 1));
+      }, [store.intervalMinutes]);
+
+      async function onToggle(next) {
+        setBusy(true);
+        await saveBalanceBadge(next);
+        setBusy(false);
+      }
+      async function refreshNow() {
+        setRefreshing(true);
+        await refreshBalance(true);
+        setRefreshing(false);
+      }
+      async function onSaveInterval() {
+        const result = await saveBalanceInterval(intervalInput);
+        if (result.ok) {
+          setIntervalInput(String(result.minutes));
+          setIntervalMsg('已保存：每 ' + result.minutes + ' 分钟刷新，立即生效，无需重启。');
+          setIntervalTone('ok');
+        } else {
+          setIntervalMsg('保存失败：' + result.error);
+          setIntervalTone('warn');
+        }
+      }
+
+      return el('div', { style: S.card },
+        el('div', { style: S.head },
+          el('div', { style: S.title }, '左下角余额徽标'),
+          el(Switch, {
+            checked: store.enabled,
+            disabled: busy,
+            label: '左下角余额徽标',
+            onChange: (event) => { void onToggle(event.target.checked); },
+          })),
+        el('div', { style: S.desc }, '开启后，在侧边栏左下角、代理状态正上方常驻显示账号余额与峰谷档位；窗口重新变为可见时立即刷新一次。关掉后停止全部请求，不残留后台轮询。数据源与手动排查的 balance.ps1 -Json 完全一致。'),
+        el('div', { style: S.status }, '当前：' + (!store.enabled ? '已关闭（停止轮询）'
+          : data ? (String(data.text || '') + ' ' + String(data.tierText || '') + ' · 更新于 ' + String(data.checkedAt || '—'))
+            : '尚未取到（等待首次刷新）')),
+        store.error ? el('div', { style: S.warn }, '取数失败：' + store.error) : null,
+        el('div', { style: S.note }, '颜色口径与代理徽标一致：绿色＝正常（低谷价），红色＝异常或高峰价，灰色＝尚未取到。'),
+        el('div', { style: { display: 'flex', gap: 8, marginTop: 12, alignItems: 'center', flexWrap: 'wrap' } },
+          el('span', { style: { fontSize: 12, opacity: 0.7 } }, '轮询间隔（分钟，1–60）'),
+          el('input', {
+            type: 'number', min: 1, max: 60, value: intervalInput,
+            onChange: (event) => setIntervalInput(event.target.value),
+            style: { width: 80, padding: '5px 8px', borderRadius: 8, border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: 13 },
+          }),
+          el('button', { style: S.btn, disabled: busy, onClick: () => { void onSaveInterval(); } }, '保存间隔'),
+          el('button', {
+            style: S.btn,
+            disabled: refreshing,
+            onClick: () => { void refreshNow(); },
+          }, refreshing ? '刷新中…' : '立即刷新')),
+        intervalMsg ? el('div', { style: intervalTone === 'warn' ? S.warn : S.ok }, intervalMsg) : null,
+        el('div', { style: S.mono }, '当前间隔：每 ' + String(store.intervalMinutes || 1) + ' 分钟（默认 1 分钟；1 分钟约 1440 次/天）'));
+    }
+
     function LqSection() {
       const native = useNativeState();
       const [patchPath, setPatchPath] = useState('');
@@ -817,16 +1013,9 @@ window.__ModuleLoader__.load({
           el('div', { style: S.head },
             el('div', { style: S.title }, '思维链优先中文'),
             el(Switch, { checked: chainZh, disabled: chainSaving, label: '思维链优先中文', onChange: onToggleChain })),
-          el('div', { style: S.desc }, '开启后，往三个 Agent 预设的 persona.suffix（系统提示尾部）写入「思考用简体中文，仅术语保留英文」；关闭后还原为空。改动写进 profile 补丁，拨动开关即自动重启生效。'),
+          el('div', { style: S.desc }, '开启后，把「思考用简体中文，仅术语保留英文」追加到三个 Agent 预设的 persona.prefix（系统提示前段，比尾部更抗长上下文稀释）；关闭后从 prefix 里删掉。改动写进 profile 补丁，拨动开关即自动重启生效。'),
           el('div', { style: S.status }, '当前：' + (chainZh ? '已开启' : '未开启') + (chainSaving ? ' · 处理中…' : '')),
           chainMessage ? el('div', { style: chainTone === 'warn' ? S.warn : chainTone === 'ok' ? S.ok : S.note }, chainMessage) : null),
-        el('div', { style: S.card },
-          el('div', { style: S.head },
-            el('div', { style: S.title }, '超限模式'),
-            el(Switch, { checked: purge, disabled: purgeSaving, label: '超限模式', onChange: onTogglePurge })),
-          el('div', { style: S.desc }, '开启后挂载 dsh-purge 并给宿主打补丁：关掉宿主自带身份句、中性化 Web 面自称、complete 预设下保留注入、旁路 hooks 审批门。关闭会还原全部宿主补丁并移除挂载。每次切换都会重启 DSH。'),
-          el('div', { style: S.status }, '当前：' + (purge ? '已开启' : '未开启') + (purgeSaving ? ' · 处理中…' : '')),
-          purgeMessage ? el('div', { style: purgeTone === 'warn' ? S.warn : purgeTone === 'ok' ? S.ok : S.note }, purgeMessage) : null),
         el('div', { style: S.card },
           el('div', { style: S.head },
             el('div', { style: S.title }, '打开资源管理器和程序'),
@@ -839,18 +1028,28 @@ window.__ModuleLoader__.load({
           native.compatibility ? el('div', { style: S.warn }, native.compatibility) : null),
         el(VisibleShellCard, {}),
         el(ProxyCard, {}),
+        el(BalanceCard, {}),
         el('div', { style: S.card },
           el('div', { style: S.title }, '说明'),
           el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；「隐藏 API」与「思维链优先中文」保存后仍按原逻辑自动重启；「打开资源管理器和程序」只保存 state.json，立即生效，不触发重启。以后要加别的个人开关，往这里加卡片即可。')));
     }
 
-    /** 侧边栏底部常驻代理状态徽标：圆点 + 简短状态，点击弹出详情 */
+    /**
+     * 侧边栏底部常驻代理状态徽标：圆点 + 简短状态，点击弹出详情。
+     * 余额行渲染在同一列内的正上方——slot 容器是横向 flex，独立注册会被排成左右并排，
+     * 所以这里让代理组件自己竖排两行，代理保持左对齐。
+     */
     function ProxyStatusBadge(props) {
       const wide = props.wide !== false;
       const store = useProxyStatus();
       const state = store.state;
+      const balance = useBalance();
 
       useEffect(() => acquireProxyPolling(), []);
+      useEffect(() => {
+        if (!balance.enabled) return undefined;
+        return acquireBalancePolling();
+      }, [balance.enabled]);
 
       const running = Boolean(state && state.running);
       const enabled = Boolean(state && state.enabled);
@@ -864,33 +1063,69 @@ window.__ModuleLoader__.load({
         + (state && state.delay ? '（' + state.delay + 'ms）' : '')
         + (state && state.port ? '（端口 ' + state.port + '）' : '');
 
-      return el('button', {
-        type: 'button',
-        title: detail + '，点击查看详情',
-        'aria-expanded': store.popover ? 'true' : 'false',
-        onClick: (event) => {
-          event.stopPropagation();
-          void refreshProxyStatus();
-          publishProxy({ popover: !proxySnapshot.popover, message: '', tone: 'note' });
-        },
+      const bData = balance.data;
+      const bPeak = Boolean(bData && bData.tier === 'peak');
+      const bColor = balance.error ? '#c0392b' : bData ? (bPeak ? '#c0392b' : '#1e8449') : 'rgba(128,128,128,0.6)';
+      const bLabel = balance.error ? '余额未知'
+        : !bData ? '余额读取中…'
+          : String(bData.text || '—') + ' ' + String(bData.tierText || '');
+      const bDetail = '余额：' + bLabel
+        + (balance.error ? '（' + balance.error + '）' : '')
+        + (bData && bData.checkedAt ? '（更新于 ' + bData.checkedAt + '）' : '');
+
+      return el('div', {
         style: {
-          display: 'flex', alignItems: 'center', gap: 8, flex: '1 1 auto',
-          minWidth: 0, width: wide ? '100%' : 'auto', padding: wide ? '6px 10px' : '6px', margin: 0,
-          background: 'transparent', border: 'none', borderRadius: 8, cursor: 'pointer',
-          color: 'inherit', fontSize: 12, textAlign: 'left', justifyContent: wide ? 'flex-start' : 'center',
+          display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: 2,
+          flex: '1 1 auto', minWidth: 0, width: wide ? '100%' : 'auto',
         },
       },
-        el('span', {
-          'aria-hidden': 'true',
+        balance.enabled ? el('div', {
+          title: bDetail,
+          'aria-label': bDetail,
           style: {
-            width: 8, height: 8, flex: '0 0 auto', borderRadius: 4, background: color,
-            boxShadow: running ? '0 0 0 3px rgba(30,132,73,0.16)' : 'none',
-            transition: 'background .2s',
+            display: 'flex', alignItems: 'center', gap: 8, minWidth: 0,
+            padding: wide ? '6px 10px' : '6px', fontSize: 12,
+            textAlign: 'left', justifyContent: wide ? 'flex-start' : 'center',
           },
-        }),
-        wide ? el('span', {
-          style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.85 },
-        }, label) : null);
+        },
+          el('span', {
+            'aria-hidden': 'true',
+            style: {
+              width: 8, height: 8, flex: '0 0 auto', borderRadius: 4, background: bColor,
+              boxShadow: bData && !balance.error && !bPeak ? '0 0 0 3px rgba(30,132,73,0.16)' : 'none',
+              transition: 'background .2s',
+            },
+          }),
+          wide ? el('span', {
+            style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.85 },
+          }, bLabel) : null) : null,
+        el('button', {
+          type: 'button',
+          title: detail + '，点击查看详情',
+          'aria-expanded': store.popover ? 'true' : 'false',
+          onClick: (event) => {
+            event.stopPropagation();
+            void refreshProxyStatus();
+            publishProxy({ popover: !proxySnapshot.popover, message: '', tone: 'note' });
+          },
+          style: {
+            display: 'flex', alignItems: 'center', gap: 8, flex: '1 1 auto',
+            minWidth: 0, width: wide ? '100%' : 'auto', padding: wide ? '6px 10px' : '6px', margin: 0,
+            background: 'transparent', border: 'none', borderRadius: 8, cursor: 'pointer',
+            color: 'inherit', fontSize: 12, textAlign: 'left', justifyContent: wide ? 'flex-start' : 'center',
+          },
+        },
+          el('span', {
+            'aria-hidden': 'true',
+            style: {
+              width: 8, height: 8, flex: '0 0 auto', borderRadius: 4, background: color,
+              boxShadow: running ? '0 0 0 3px rgba(30,132,73,0.16)' : 'none',
+              transition: 'background .2s',
+            },
+          }),
+          wide ? el('span', {
+            style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.85 },
+          }, label) : null));
     }
 
     /** 徽标弹层：状态明细 + 测试延迟并刷新节点 / 停止内核；渲染在 shell.overlay 里 */
@@ -1025,6 +1260,7 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
+      void loadBalanceSettings();
       ctx.effect(() => installNativeOpening(ctx), 'dsh-lqconfig: native opening');
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({
         name: 'shell.overlay', id: 'dsh-lqconfig.native-open-notice', order: 90,
@@ -1032,6 +1268,7 @@ window.__ModuleLoader__.load({
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({
         name: 'shell.overlay', id: 'dsh-lqconfig.proxy-status', order: 91,
       }, ProxyStatusPopover));
+      // 余额行由 ProxyStatusBadge 内部渲染在代理上方（slot 本身是横向 flex，独立注册会并排）
       ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
         name: 'sidebar.footer.action', id: 'dsh-lqconfig.proxy-badge', order: 90,
       }, ProxyStatusBadge));
