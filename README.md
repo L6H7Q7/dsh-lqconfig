@@ -19,15 +19,6 @@
   `ELECTRON_RUN_AS_NODE` 后拉 EXE，按 PID 逐个杀（排除助手自己，避免
   `taskkill /f /im` 把助手一起杀掉导致「只关闭不重启」），再校验新实例是否真的起来，
   失败走 `cmd /c start` 兜底。全过程写 `%TEMP%\dsh-lqconfig-restart.log`。
-  超限模式打完补丁的那次重启会带 `--swap-asar`：把 `app.asar` 挪成 `app.asar.bak`，
-  让宿主改从 `resources\app` 启动（补丁才生效）；起不来会自动把 `.bak` 还原再拉一次。
-- **统一重启入口**：超限模式面板里的「现在重启」也走同一个助手（`globalThis.__dshLqRestart`），
-  不再混用 purge 自带的 wscript / PowerShell / restart-desktop 三套实现；启动阶段打完补丁
-  就地自动重启一次，不再留「要现在重启吗」等用户再点。
-- **启动自愈**：启动 14 秒后若发现「asar 还在 + 补丁已写进 `resources\app`」（或
-  `boot_full_quit` 为真），就自己调 purge 的重启路由做那次换包重启；同一份 asar 十分钟内
-  只自动重启一次（`.auto-restart.json` 防循环），换包成功后条件自然消失。
-  决策过程写 `%TEMP%\dsh-lqconfig-diag.log`，也可 `GET /dsh-lqconfig/api/diag` 自查。
 
 ## 安装
 

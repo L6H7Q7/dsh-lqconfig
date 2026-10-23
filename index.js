@@ -11,7 +11,7 @@
  * 路由前缀：/dsh-lqconfig/api/*（同源 HTTP，供设置页「LQ配置」使用）
  */
 import { promises as fs } from 'node:fs';
-import { existsSync, writeFileSync, unlinkSync, appendFileSync, readFileSync, statSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
@@ -22,8 +22,6 @@ export const name = 'dsh-lqconfig';
 export const inject = ['webServer'];
 
 const ROUTE_PREFIX = '/dsh-lqconfig';
-// 本进程 webServer 的监听端口，超限模式要用它调插件自己的同源路由。
-let localPort = 0;
 const BLOCK_START = '# >>> dsh-lqconfig: DeepSeek API 通道开关（自动生成，请勿手改）';
 const BLOCK_END = '# <<< dsh-lqconfig';
 const ROW_ID = 'llm-deepseek';
@@ -51,47 +49,6 @@ function exePath() {
   return process.env.DSH_DESKTOP_EXE || 'D:\\AI\\Agent\\DeepSeek Harness\\DeepSeek Harness.exe';
 }
 
-/** 官方桌面包的密封归档。它在的时候宿主加载的是它，而不是 resources\app。 */
-function asarPath() {
-  return path.join(path.dirname(exePath()), 'resources', 'app.asar');
-}
-
-/** 桌面宿主才做「杀进程 + 拉 exe」，网页/无头宿主没有这条链路。 */
-function desktopRestartAvailable() {
-  return process.platform === 'win32' && existsSync(exePath());
-}
-
-const DIAG_LOG = path.join(process.env.TEMP || os.tmpdir(), 'dsh-lqconfig-diag.log');
-
-/** 重启决策写盘：出问题直接看这一行，不用猜。 */
-function diag(event, data) {
-  try {
-    const payload = data === undefined ? '' : ' ' + JSON.stringify(data);
-    appendFileSync(DIAG_LOG, new Date().toISOString() + ' ' + event + payload + '\n');
-  } catch { /* 日志写不进去不该影响重启 */ }
-}
-
-/** 自动重启的防循环戳：同一份 app.asar 十分钟内只自动重启一次。 */
-function autoRestartStampPath() {
-  return path.join(path.dirname(fileURLToPath(import.meta.url)), '.auto-restart.json');
-}
-
-function asarIdentity() {
-  try {
-    const stat = statSync(asarPath());
-    return { size: stat.size, mtimeMs: Math.round(stat.mtimeMs) };
-  } catch { return null; }
-}
-
-async function fetchPurgeStatus() {
-  if (!localPort) return null;
-  try {
-    const res = await fetch('http://127.0.0.1:' + localPort + '/dsh-purge/status');
-    if (!res.ok) return null;
-    return await res.json();
-  } catch { return null; }
-}
-
 function disabledBlock() {
   return [
     BLOCK_START,
@@ -108,121 +65,6 @@ function stamp() {
   const p = (n) => String(n).padStart(2, '0');
   const ms = String(d.getMilliseconds()).padStart(3, '0');
   return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + ms;
-}
-
-// ── 超限模式（dsh-purge）────────────────────────────────────────────────
-// 开：往 profile patch 插 system-prompt 覆盖 + dsh-purge 挂载行，并跑插件 CLI 打宿主补丁。
-// 关：跑 CLI 还原宿主补丁，再整段移除挂载行。切换后必须重启 DSH 才生效。
-const PURGE_START = '# >>> dsh-lqconfig: 超限模式（dsh-purge，自动生成，请勿手改）';
-const PURGE_END = '# <<< dsh-lqconfig: 超限模式结束';
-
-function purgeDir() {
-  // 物理合并：插件本体在 lqconfig 目录下的 vendor/dsh-purge。
-  return path.join(path.dirname(fileURLToPath(import.meta.url)), 'vendor', 'dsh-purge');
-}
-
-/** 「开」是两阶段：先挂载插件重启，重启后由本进程调插件自己的 /dsh-purge/apply。 */
-function purgePendingFlag() {
-  return path.join(path.dirname(fileURLToPath(import.meta.url)), '.purge-pending');
-}
-
-function markPurgePending(on) {
-  const flag = purgePendingFlag();
-  try {
-    if (on) writeFileSync(flag, new Date().toISOString(), 'utf8');
-    else if (existsSync(flag)) unlinkSync(flag);
-  } catch { /* 标记写失败最多导致多打一次补丁，不会卡死开关 */ }
-}
-
-export function hasPurgePending() {
-  return existsSync(purgePendingFlag());
-}
-
-/** 调插件自己注册的同源路由——只有进程内调用才能解开 app.asar。 */
-async function callPurgeRoute(route) {
-  const port = localPort;
-  if (!port) return { ok: false, error: 'webServer 端口未就绪' };
-  try {
-    const res = await fetch('http://127.0.0.1:' + port + route, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: '{}',
-    });
-    const text = await res.text();
-    let data = null;
-    try { data = JSON.parse(text); } catch { data = null; }
-    return { ok: res.ok && (data ? data.ok !== false : true), status: res.status, data, tail: text.slice(-1200) };
-  } catch (error) {
-    return { ok: false, error: String(error && error.message ? error.message : error) };
-  }
-}
-
-function purgeOnBlock() {
-  return [
-    PURGE_START,
-    '- id: system-prompt',
-    '  config:',
-    '    includeHarnessIdentity: false',
-    '    personaPrefix: ""',
-    '    personaSuffix: ""',
-    '- insert:',
-    '    - id: dsh-purge',
-    '      name: ./local/dsh-lqconfig/vendor/dsh-purge/lib/index.js',
-    '      inject: [systemPrompt, tools]',
-    '      config:',
-    '        enabled: true',
-    '        autoApplyOnStart: true',
-    '        autoUpdateOnStart: false',
-    '        autoRevertOnMissing: false',
-    '        injectOnce: false',
-    '        stripMnemon: true',
-    '        verbose: false',
-    '        postPrompt: ""',
-    '        postPromptOrder: 5100',
-    '        autoRetry: true',
-    '        retryMax: 3',
-    '        autoContinue: false',
-    '        continueMax: 3',
-    '        continueText: "继续"',
-    '        capabilityProtocol: true',
-    '        hooksDenyBypass: true',
-    // 演练台三个子插件：不挂上就没有 POST /redteam/api，面板会拿到 405。
-    '    - id: dsh-purge-redteam',
-    '      name: ./local/dsh-lqconfig/vendor/dsh-purge/lib/redteam/index.js',
-    '    - id: dsh-purge-redteam-store',
-    '      name: ./local/dsh-lqconfig/vendor/dsh-purge/lib/redteam/store.js',
-    '    - id: dsh-purge-redteam-ui',
-    '      name: ./local/dsh-lqconfig/vendor/dsh-purge/lib/redteam/ui.js',
-    PURGE_END,
-    '',
-  ].join('\n');
-}
-
-/** 已挂载时，由本进程触发插件补丁；未挂载时返回原因，交给重启后的第二阶段。 */
-async function applyPurgeInProcess() {
-  return await callPurgeRoute('/dsh-purge/apply');
-}
-
-/** 开关本体：on=true 追加挂载块；on=false 整段移除。 */
-export async function writePurgeMode(on) {
-  const file = patchPath();
-  if (!existsSync(file)) throw new Error('找不到 profile patch：' + file);
-  const text = await fs.readFile(file, 'utf8');
-  const hasBlock = text.includes(PURGE_START);
-  let next = text;
-  if (hasBlock) {
-    const start = text.indexOf(PURGE_START);
-    const end = text.indexOf(PURGE_END, start);
-    const cut = end >= 0 ? end + PURGE_END.length : text.length;
-    // 只删块本身，不碰其它段落之间的空行；结尾收成单换行。
-    next = (text.slice(0, start) + text.slice(cut)).replace(/\n+$/, '\n');
-  }
-  if (on) next = next.replace(/\s*$/, '\n') + '\n' + purgeOnBlock();
-  if (next === text) return { changed: false, backup: null };
-  const bak = file + '.bak-lqconfig-' + stamp();
-  await fs.copyFile(file, bak);
-  await fs.writeFile(file, next, 'utf8');
-  return { changed: true, backup: bak };
 }
 
 // Native opening belongs to this plugin; it does not alter the profile patch.
@@ -589,7 +431,6 @@ export async function readState() {
   return {
     enabled: !text.includes(BLOCK_START),
     chainZh: text.includes(ZH_SUFFIX),
-    purge: text.includes(PURGE_START),
     ...(await readNativeSettings()),
     balanceBadge: await readBalanceBadge(),
     balanceIntervalMinutes: await readBalanceInterval(),
@@ -654,7 +495,7 @@ export async function writeChainZh(enabled) {
   return { changed: true, backup: bak };
 }
 
-async function restartApp(options = {}) {
+async function restartApp() {
   const exe = exePath();
   if (!existsSync(exe)) throw new Error('找不到应用可执行文件：' + exe);
 
@@ -665,10 +506,6 @@ async function restartApp(options = {}) {
   // 现在交给独立助手进程：它自己以 Node 模式跑，拉起 EXE 前把变量洗掉。
   const helper = fileURLToPath(new URL('./restart-helper.mjs', import.meta.url));
   const args = [helper, exe];
-  // 超限模式打完补丁后，补丁在 resources\app，宿主还在读 resources\app.asar：
-  // 这一次重启顺手把 asar 挪成 .bak，下次启动加载的就是打过补丁的 resources\app。
-  const swapAsar = options.swapAsar === true;
-  if (swapAsar) args.push('--swap-asar=' + asarPath());
   const child = spawn(process.execPath, args, {
     detached: true,
     stdio: 'ignore',
@@ -677,7 +514,7 @@ async function restartApp(options = {}) {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
   });
   child.unref();
-  return { exe, helper, pid: child.pid, swapAsar };
+  return { exe, helper, pid: child.pid };
 }
 
 function sendJson(res, status, obj) {
@@ -705,103 +542,6 @@ export function apply(ctx) {
   // 插件卸载时停掉内核，避免遗留孤儿进程
   ctx.effect(() => () => { proxy.stopSync(); }, 'dsh-lqconfig: proxy cleanup');
 
-  try { localPort = Number(ctx.webServer?.port) || 0; } catch { localPort = 0; }
-
-  // 统一重启入口：超限模式（dsh-purge）的「现在重启」也调这里，
-  // 不再让 purge 自己那套 wscript / PowerShell / restart-desktop 各玩各的。
-  if (desktopRestartAvailable()) {
-    try {
-      globalThis.__dshLqRestart = (options) => restartApp(options || {});
-      ctx.effect(() => () => { try { delete globalThis.__dshLqRestart; } catch { /* 忽略 */ } }, 'dsh-lqconfig: restart hook');
-    } catch { /* 没有全局对象也不影响自带面板 */ }
-  }
-
-  // 超限模式第二阶段：开关是把「挂载」写进 profile 的，插件要重启后才在进程里，
-  // 所以补丁只能在这次启动后由这里调它自己的 /dsh-purge/apply。
-  // 打完补丁必须重启才生效——这一次就是「启动时唯一的重启」，顺手把 app.asar 换掉，
-  // 不再留着让面板弹「要现在重启吗」补第二次。
-  if (hasPurgePending()) {
-    const timer = setTimeout(async () => {
-      for (let attempt = 0; attempt < 20; attempt += 1) {
-        const result = await callPurgeRoute('/dsh-purge/apply');
-        if (result.ok) {
-          markPurgePending(false);
-          const data = result.data && typeof result.data === 'object' ? result.data : {};
-          // complete 会因为 pattern_not_found 这类"不阻断"的失败变成 false（purge 自己
-          // 也是这么设计的：promptReady 仍然允许重启）。所以这里只把真正阻断的失败算进去，
-          // 否则就会出现「补丁已写盘、却永远不重启」，又退回弹窗让用户手点。
-          const failedItems = Array.isArray(data.failed_items) ? data.failed_items : [];
-          const blocking = failedItems.filter((item) => item && item.status && item.status !== 'pattern_not_found').length;
-          const settled = data.ok !== false && blocking === 0;
-          const swapAsar = settled && data.asar_still_sealed === true;
-          const wantRestart = settled && (swapAsar || data.restarting === true || data.needs_full_quit === true);
-          diag('apply.result', {
-            ok: data.ok, complete: data.complete, restarting: data.restarting,
-            needs_full_quit: data.needs_full_quit, asar_still_sealed: data.asar_still_sealed,
-            applied: data.applied, already: data.already, failed: data.failed,
-            blocking, settled, swapAsar, wantRestart,
-          });
-          if (wantRestart) {
-            await new Promise((resolve) => { const t = setTimeout(resolve, 1500); t.unref?.(); });
-            diag('apply.restart', { swapAsar });
-            try {
-              await restartApp({ swapAsar });
-            } catch (error) {
-              diag('apply.restart.error', { error: String(error && error.message ? error.message : error) });
-            }
-          }
-          return;
-        }
-        await new Promise((resolve) => { const t = setTimeout(resolve, 3000); t.unref?.(); });
-      }
-      try { ctx.logger?.warn?.('[dsh-lqconfig] 超限模式补丁应用失败：插件路由一直没就绪'); } catch { /* 忽略 */ }
-    }, 6000);
-    timer.unref?.();
-    ctx.effect(() => () => clearTimeout(timer), 'dsh-lqconfig: purge apply');
-  }
-
-  // 兜底自愈：若这次启动后 purge 仍挂着 boot_full_quit（补丁在 resources\app、
-  // 但宿主还在读 app.asar），就直接把这一次"换包重启"做掉，不再留给面板弹窗让用户点。
-  // 走 purge 自己的 /dsh-purge/restart（它用 ensureRestartReady 把关），而该路由已经
-  // 优先转给本插件的 __dshLqRestart，所以执行端始终是同一个 helper。
-  // 防循环：同一份 asar 十分钟内只自动重启一次；换包成功后 asar 不在了，条件自然消失。
-  // 紧急停用：这个自愈在 asar 状态判断失灵时会变成"每 20 秒重启一次"。
-  // 默认关闭，只有显式设了 LQC_AUTO_HEAL=1 才跑。
-  const healTimer = process.env.LQC_AUTO_HEAL === '1' ? setTimeout(async () => {
-    if (!desktopRestartAvailable() || hasPurgePending()) return;
-    try {
-      const status = await fetchPurgeStatus();
-      if (!status) return;
-      // 条件不是只看 boot_full_quit：补丁已经写进 resources\app、asar 还在，
-      // 这两种情形都意味着"宿主还在跑旧包"，那就该换包重启一次。
-      const sealed = status.asar_still_sealed === true;
-      const appliedCount = Number(status.patches_applied) || 0;
-      if (!sealed || appliedCount <= 0) {
-        diag('heal.skip', { reason: sealed ? 'no-patches' : 'unsealed', appliedCount, bootFullQuit: status.boot_full_quit });
-        return;
-      }
-      const identity = asarIdentity();
-      if (!identity) {
-        diag('heal.skip', { reason: 'no-asar' });
-        return;
-      }
-      let stamp = null;
-      try { stamp = JSON.parse(readFileSync(autoRestartStampPath(), 'utf8')); } catch { stamp = null; }
-      const sameAsar = stamp && stamp.size === identity.size && stamp.mtimeMs === identity.mtimeMs;
-      if (sameAsar && Date.now() - Number(stamp.at || 0) < 10 * 60 * 1000) {
-        diag('heal.skip', { reason: 'recent', identity });
-        return;
-      }
-      writeFileSync(autoRestartStampPath(), JSON.stringify({ at: Date.now(), ...identity }), 'utf8');
-      diag('heal.restart', { identity });
-      const planned = await callPurgeRoute('/dsh-purge/restart');
-      diag('heal.result', planned && planned.data ? planned.data : { ok: planned.ok, error: planned.error });
-    } catch (error) {
-      diag('heal.error', { error: String(error && error.message ? error.message : error) });
-    }
-  }, 14000) : null;
-  healTimer?.unref?.();
-  ctx.effect(() => () => clearTimeout(healTimer), 'dsh-lqconfig: restart self heal');
 
   // 开关打开时，启动后自动预热内核；不阻塞 apply，失败只记日志
   let warmupTimer = setTimeout(() => {
@@ -938,22 +678,8 @@ export function apply(ctx) {
               }
               return sendJson(res, 404, { ok: false, error: 'not found' });
             }
-            if (req.method === 'GET' && route === '/api/diag') {
-              let stamp = null;
-              try { stamp = JSON.parse(readFileSync(autoRestartStampPath(), 'utf8')); } catch { stamp = null; }
-              return sendJson(res, 200, {
-                ok: true,
-                purgePending: hasPurgePending(),
-                asar: asarIdentity(),
-                desktopRestart: desktopRestartAvailable(),
-                unifiedHook: typeof globalThis.__dshLqRestart === 'function',
-                lastAutoRestart: stamp,
-                diagLog: DIAG_LOG,
-              });
-            }
             if (req.method === 'POST' && route === '/api/restart') {
-              const body = await readBody(req);
-              return sendJson(res, 200, { ok: true, ...(await restartApp({ swapAsar: body.swapAsar === true })) });
+              return sendJson(res, 200, { ok: true, ...(await restartApp()) });
             }
             return sendJson(res, 404, { ok: false, error: 'not found' });
           } catch (error) {

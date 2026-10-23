@@ -858,10 +858,6 @@ window.__ModuleLoader__.load({
       const [chainMessage, setChainMessage] = useState('');
       const [chainTone, setChainTone] = useState('note');
 
-      const [purge, setPurge] = useState(false);
-      const [purgeSaving, setPurgeSaving] = useState(false);
-      const [purgeMessage, setPurgeMessage] = useState('');
-      const [purgeTone, setPurgeTone] = useState('note');
 
       useEffect(() => { void load(); }, []);
 
@@ -872,7 +868,6 @@ window.__ModuleLoader__.load({
           if (!data.ok) throw new Error(data.error || '读取失败');
           setHidden(!data.enabled);
           setChainZh(Boolean(data.chainZh));
-          setPurge(Boolean(data.purge));
           setPatchPath(data.patchPath || '');
         } catch (error) {
           setMessage('读取失败：' + String(error && error.message ? error.message : error));
@@ -947,47 +942,12 @@ window.__ModuleLoader__.load({
         void persistChain(next);
       }
 
-      async function persistPurge(next) {
-        setPurgeSaving(true);
-        setPurgeMessage('');
-        try {
-          const res = await fetch(API + '/purge', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ on: next }),
-          });
-          const data = await res.json();
-          if (!data.ok) throw new Error((data.error || '保存失败') + (data.tail ? '：' + String(data.tail).slice(-400) : ''));
-          setPurge(Boolean(data.purge));
-          if (data.changed) {
-            if (data.note) { setPurgeMessage(data.note); setPurgeTone('note'); }
-            await restartAt('purge');
-            return;
-          }
-          setPurgeMessage('没有变化，无需重启。');
-          setPurgeTone('note');
-          setPurgeSaving(false);
-        } catch (error) {
-          setPurge(!next);
-          setPurgeMessage('失败：' + String(error && error.message ? error.message : error));
-          setPurgeTone('warn');
-          setPurgeSaving(false);
-        }
-      }
-
-      function onTogglePurge(event) {
-        const next = event.target.checked;
-        setPurge(next);
-        void persistPurge(next);
-      }
-
       /** which: 'api' | 'chain' —— 重启状态显示在触发它的那张卡片上 */
       async function restartAt(which) {
         const isChain = which === 'chain';
-        const isPurge = which === 'purge';
-        const setS = isPurge ? setPurgeSaving : isChain ? setChainSaving : setSaving;
-        const setM = isPurge ? setPurgeMessage : isChain ? setChainMessage : setMessage;
-        const setT = isPurge ? setPurgeTone : isChain ? setChainTone : setTone;
+        const setS = isChain ? setChainSaving : setSaving;
+        const setM = isChain ? setChainMessage : setMessage;
+        const setT = isChain ? setChainTone : setTone;
         setS(true);
         setM('正在重启，页面稍后会断开…');
         setT('note');
