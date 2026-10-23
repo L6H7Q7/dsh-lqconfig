@@ -241,6 +241,23 @@ function configYaml(settings) {
     'tcp-concurrent: true',
     'external-controller: 127.0.0.1:' + settings.apiPort,
     'secret: ' + settings.secret,
+    // 节点域名由机场频繁轮换，系统 DNS（路由器）常缓存到已下线的旧 IP；
+    // 内核自带 DoH 解析，绕开系统 DNS，避免「隧道建好但 TLS 必失败」。
+    'dns:',
+    '  enable: true',
+    '  ipv6: false',
+    '  enhanced-mode: fake-ip',
+    '  fake-ip-range: 198.18.0.1/16',
+    '  fake-ip-filter:',
+    '    - "+.lan"',
+    '    - "+.local"',
+    '  default-nameserver:',
+    '    - 223.5.5.5',
+    '    - 119.29.29.29',
+    '  nameserver:',
+    '    - https://dns.alidns.com/dns-query',
+    '    - https://doh.pub/dns-query',
+    '    - 223.5.5.5',
     'proxy-providers:',
     '  zhuiyun:',
     '    type: file',
@@ -459,6 +476,29 @@ export async function pickAndSwitch(settingsOverride) {
 }
 
 /** force=true 时跳过 mtime 判断、立刻重拉订阅（面板「测试延迟并刷新节点」用）；默认惰性刷新。 */
+/** 拉起内核：先杀旧进程再启动，确保 config.yaml（含 dns 段）真正被加载 */
+async function startKernel(settings) {
+  await killByPidFile();
+  for (let i = 0; i < 25; i += 1) {
+    if (!(await portOpen(settings.port)) && !(await portOpen(settings.apiPort))) break;
+    await sleep(120);
+  }
+  const child = spawn(BIN, ['-d', DATA, '-f', CONFIG], {
+    cwd: HERE,
+    windowsHide: true,
+    stdio: 'ignore',
+    detached: true,
+  });
+  child.unref();
+  await fs.writeFile(PID_FILE, String(child.pid), 'utf8');
+  let ready = false;
+  for (let i = 0; i < 50; i += 1) {
+    if (await portOpen(settings.apiPort)) { ready = true; break; }
+    await sleep(200);
+  }
+  if (!ready) throw new Error('内核未在 10 秒内就绪');
+}
+
 export async function ensure(force = false) {
   const settings = await readSettings();
   if (!settings.enabled) throw new Error('代理开关未开启');
@@ -471,24 +511,22 @@ export async function ensure(force = false) {
   await fs.writeFile(CONFIG, configYaml(settings), 'utf8');
 
   const already = (await portOpen(settings.port)) && (await portOpen(settings.apiPort));
-  if (!already) {
-    await killByPidFile();
-    const child = spawn(BIN, ['-d', DATA, '-f', CONFIG], {
-      cwd: HERE,
-      windowsHide: true,
-      stdio: 'ignore',
-      detached: true,
-    });
-    child.unref();
-    await fs.writeFile(PID_FILE, String(child.pid), 'utf8');
-    let ready = false;
-    for (let i = 0; i < 50; i += 1) {
-      if (await portOpen(settings.apiPort)) { ready = true; break; }
-      await sleep(200);
-    }
-    if (!ready) throw new Error('内核未在 10 秒内就绪');
-  }
+  if (!already) await startKernel(settings);
 
-  const picked = await pickAndSwitch(settings);
+  let picked;
+  try {
+    picked = await pickAndSwitch(settings);
+  } catch (first) {
+    // 自愈：节点全挂多半是订阅端口/域名变化，或系统 DNS 缓存了下线 IP。
+    // 强制重拉订阅 + 用新配置（含 DoH）重启内核，再挑一次；仍失败才抛原错误。
+    await refreshProvider(settings, true);
+    await fs.writeFile(CONFIG, configYaml(settings), 'utf8');
+    await startKernel(settings);
+    try {
+      picked = await pickAndSwitch(settings);
+    } catch {
+      throw first;
+    }
+  }
   return { proxy: 'http://127.0.0.1:' + settings.port, refreshed, nodes: entries.length, ...picked };
 }
