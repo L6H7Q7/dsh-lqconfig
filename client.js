@@ -925,10 +925,11 @@ window.__ModuleLoader__.load({
       const [message, setMessage] = useState('');
       const [tone, setTone] = useState('note');
 
-      const [chainZh, setChainZh] = useState(false);
-      const [chainSaving, setChainSaving] = useState(false);
-      const [chainMessage, setChainMessage] = useState('');
-      const [chainTone, setChainTone] = useState('note');
+      const [rules, setRules] = useState(false);
+      const [rulesSaving, setRulesSaving] = useState(false);
+      const [rulesMessage, setRulesMessage] = useState('');
+      const [rulesTone, setRulesTone] = useState('note');
+      const [rulesInfo, setRulesInfo] = useState(null);
 
 
       useEffect(() => { void load(); }, []);
@@ -939,8 +940,15 @@ window.__ModuleLoader__.load({
           const data = await res.json();
           if (!data.ok) throw new Error(data.error || '读取失败');
           setHidden(!data.enabled);
-          setChainZh(Boolean(data.chainZh));
+          setRules(Boolean(data.globalRules));
           setPatchPath(data.patchPath || '');
+          try {
+            const infoRes = await fetch(API + '/global-rules', { cache: 'no-store' });
+            const info = await infoRes.json();
+            if (info.ok) setRulesInfo(info);
+          } catch {
+            // 规则源信息读不到不影响其它卡片
+          }
         } catch (error) {
           setMessage('读取失败：' + String(error && error.message ? error.message : error));
           setTone('warn');
@@ -981,45 +989,66 @@ window.__ModuleLoader__.load({
         void persist(next);
       }
 
-      async function persistChain(next) {
-        setChainSaving(true);
-        setChainMessage('');
+      async function persistRules(next) {
+        setRulesSaving(true);
+        setRulesMessage('');
         try {
-          const res = await fetch(API + '/chain-zh', {
+          const res = await fetch(API + '/global-rules', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ enabled: next }),
           });
           const data = await res.json();
           if (!data.ok) throw new Error(data.error || '保存失败');
-          setChainZh(Boolean(data.chainZh));
+          setRules(Boolean(data.globalRules));
           if (data.changed) {
-            await restartAt('chain');
+            await restartAt('rules');
             return;
           }
-          setChainMessage('没有变化，无需重启。');
-          setChainTone('note');
-          setChainSaving(false);
+          setRulesMessage('没有变化，无需重启。');
+          setRulesTone('note');
+          setRulesSaving(false);
         } catch (error) {
-          setChainZh(!next);
-          setChainMessage('保存失败：' + String(error && error.message ? error.message : error));
-          setChainTone('warn');
-          setChainSaving(false);
+          setRules(!next);
+          setRulesMessage('保存失败：' + String(error && error.message ? error.message : error));
+          setRulesTone('warn');
+          setRulesSaving(false);
         }
       }
 
-      function onToggleChain(event) {
+      function onToggleRules(event) {
         const next = event.target.checked;
-        setChainZh(next);
-        void persistChain(next);
+        setRules(next);
+        void persistRules(next);
       }
 
-      /** which: 'api' | 'chain' —— 重启状态显示在触发它的那张卡片上 */
+      async function syncRules() {
+        setRulesSaving(true);
+        setRulesMessage('');
+        try {
+          const res = await fetch(API + '/global-rules/sync', { method: 'POST' });
+          const data = await res.json();
+          if (!data.ok) throw new Error(data.error || '重新注入失败');
+          setRules(Boolean(data.globalRules));
+          setRulesMessage(data.changed ? '已重新注入三个预设，正在重启…' : '源文件未变，补丁已是最新。');
+          setRulesTone(data.changed ? 'note' : 'ok');
+          if (data.changed) {
+            await restartAt('rules');
+            return;
+          }
+          setRulesSaving(false);
+        } catch (error) {
+          setRulesMessage('重新注入失败：' + String(error && error.message ? error.message : error));
+          setRulesTone('warn');
+          setRulesSaving(false);
+        }
+      }
+
+      /** which: 'api' | 'rules' —— 重启状态显示在触发它的那张卡片上 */
       async function restartAt(which) {
-        const isChain = which === 'chain';
-        const setS = isChain ? setChainSaving : setSaving;
-        const setM = isChain ? setChainMessage : setMessage;
-        const setT = isChain ? setChainTone : setTone;
+        const setS = which === 'rules' ? setRulesSaving : setSaving;
+        const setM = which === 'rules' ? setRulesMessage : setMessage;
+        const setT = which === 'rules' ? setRulesTone : setTone;
         setS(true);
         setM('正在重启，页面稍后会断开…');
         setT('note');
@@ -1043,11 +1072,18 @@ window.__ModuleLoader__.load({
           patchPath ? el('div', { style: S.mono }, '补丁：' + patchPath) : null),
         el('div', { style: S.card },
           el('div', { style: S.head },
-            el('div', { style: S.title }, '思维链优先中文'),
-            el(Switch, { checked: chainZh, disabled: chainSaving, label: '思维链优先中文', onChange: onToggleChain })),
-          el('div', { style: S.desc }, '开启后，把「思考用简体中文，仅术语保留英文」追加到三个 Agent 预设的 persona.prefix（系统提示前段，比尾部更抗长上下文稀释）；关闭后从 prefix 里删掉。改动写进 profile 补丁，拨动开关即自动重启生效。'),
-          el('div', { style: S.status }, '当前：' + (chainZh ? '已开启' : '未开启') + (chainSaving ? ' · 处理中…' : '')),
-          chainMessage ? el('div', { style: chainTone === 'warn' ? S.warn : chainTone === 'ok' ? S.ok : S.note }, chainMessage) : null),
+            el('div', { style: S.title }, '全局规则'),
+            el(Switch, { checked: rules, disabled: rulesSaving, label: '全局规则', onChange: onToggleRules })),
+          el('div', { style: S.desc }, '开启后，把插件目录 GLOBAL-RULES.md 的正文压成单行，注入三个 Agent 预设的 persona.prefix（系统提示前段）；关闭时只移除标记块，其余字符不动。改动写进 profile 补丁，拨动开关即自动重启生效；源文件改完点「重新注入」。'),
+          el('div', { style: S.status }, '当前：' + (rules ? '已注入 3/3 个预设' : '未注入') + (rulesSaving ? ' · 处理中…' : '')
+            + (rulesInfo && rulesInfo.exists
+              ? ' · 源 ' + rulesInfo.sourceBytes + ' 字节 / ' + rulesInfo.sourceLines + ' 行 → ' + rulesInfo.injectedChars + ' 字符单行'
+              : ' · 源文件缺失')),
+          rulesInfo && rulesInfo.truncated ? el('div', { style: S.warn }, '源文件超出单行注入上限，注入时已截断。') : null,
+          rulesMessage ? el('div', { style: rulesTone === 'warn' ? S.warn : rulesTone === 'ok' ? S.ok : S.note }, rulesMessage) : null,
+          el('div', { style: { marginTop: 10 } },
+            el('button', { style: S.btn, disabled: rulesSaving || !rules, onClick: () => { void syncRules(); } }, '重新注入')),
+          rulesInfo ? el('div', { style: S.mono }, '源：' + rulesInfo.path) : null),
         el('div', { style: S.card },
           el('div', { style: S.head },
             el('div', { style: S.title }, '打开资源管理器和程序'),
@@ -1063,7 +1099,7 @@ window.__ModuleLoader__.load({
         el(BalanceCard, {}),
         el('div', { style: S.card },
           el('div', { style: S.title }, '说明'),
-          el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；「隐藏 API」与「思维链优先中文」保存后仍按原逻辑自动重启；「打开资源管理器和程序」只保存 state.json，立即生效，不触发重启。以后要加别的个人开关，往这里加卡片即可。')));
+          el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；「隐藏 API」与「全局规则」保存后仍按原逻辑自动重启；「打开资源管理器和程序」只保存 state.json，立即生效，不触发重启。规则正文（含思维链那句）统一写在 GLOBAL-RULES.md，改完点「重新注入」。以后要加别的个人开关，往这里加卡片即可。')));
     }
 
     /**

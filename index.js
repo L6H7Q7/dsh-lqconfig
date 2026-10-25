@@ -3,7 +3,7 @@
  *
  * 个人设置与系统文件打开：
  *   1. 开关 DeepSeek API 通道（llm-deepseek 这一行）——写 profiles/desktop/cordis.patch.yml，带备份
- *   2. 开关「思维链优先中文」——改写三个 preset 里 persona.suffix（系统提示尾部），带备份
+ *   2. 全局规则——把 GLOBAL-RULES.md 压成单行注入三个 preset 的 persona.prefix（系统提示前段），带备份
  *   3. 重启应用（确认后由本进程拉起外部脚本：延时 → 结束进程 → 重新启动）
  *
  *   4. 打开资源管理器和程序——状态只写同目录 state.json，默认关闭，不需重启
@@ -27,15 +27,19 @@ const BLOCK_END = '# <<< dsh-lqconfig';
 const ROW_ID = 'llm-deepseek';
 const ROW_NAME = '@deepseek-ai/dsh-llm-deepseek-api-key';
 
-/**
- * 思维链优先中文 —— 写进三个 preset 的 persona.suffix（系统提示尾部）。
- * 实测依据：persona 是唯一落在系统提示里的注入点，比 AGENTS.md 的会话级指令权重更高。
- */
-const ZH_SUFFIX =
-  '思考与回答默认简体中文，代码、命令、API 与产品名保留英文；除非没有通用中文译法，不要整句使用英文。';
-
-/** 匹配 persona 块里 10 空格缩进的 prefix 行（中文约束挂在 prefix 上，不重复写 suffix） */
+/** 匹配 persona 块里 10 空格缩进的 prefix 行（规则块挂在 prefix 行尾，suffix 保持为空） */
 const PERSONA_PREFIX_LINE_RE = /^ {10}prefix: .*$/gm;
+
+/**
+ * 全局规则 —— 把插件目录 GLOBAL-RULES.md 的正文压成单行，注入三个 preset 的 persona.prefix。
+ * 标记块保证开/关幂等：开 = 清旧块后追加，关 = 只删块。
+ */
+const RULES_FILE = fileURLToPath(new URL('./GLOBAL-RULES.md', import.meta.url));
+const RULES_START = '[[dsh-lqconfig:global-rules]]';
+const RULES_END = '[[/dsh-lqconfig:global-rules]]';
+/** 单行注入上限：三个 prefix 各一份，超长会明显吃系统提示 */
+const RULES_LIMIT = 16000;
+const RULES_RE = / ?\[\[dsh-lqconfig:global-rules\]\][\s\S]*?\[\[\/dsh-lqconfig:global-rules\]\]/g;
 
 function dshHome() {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
@@ -488,7 +492,7 @@ export async function readState() {
   const text = exists ? await fs.readFile(file, 'utf8') : '';
   return {
     enabled: !text.includes(BLOCK_START),
-    chainZh: text.includes(ZH_SUFFIX),
+    globalRules: text.includes(RULES_START),
     ...(await readNativeSettings()),
     balanceBadge: await readBalanceBadge(),
     balanceIntervalMinutes: await readBalanceInterval(),
@@ -528,29 +532,69 @@ export async function writeEnabled(enabled) {
 }
 
 /**
- * 开关「思维链优先中文」：把约束追加到 persona 的 prefix 行尾，其余字符一律不动。
- * 打开 = 三个 preset 的 prefix 行尾追加一句；关闭 = 把那句删掉（兼容旧的 suffix 写法）。
- * 选择 prefix 而不是 suffix：prefix 在提示前段（身份区），suffix 排在 order 10200 的最尾部，
- * 长上下文里尾部约束更容易被稀释。
+ * 读规则源文件并压成单行：去 BOM、逐行 trim、丢空行、空格连接、压掉连续空白。
+ * persona.prefix 是单引号 YAML 标量，不能带换行，所以只能单行化。
  */
-export async function writeChainZh(enabled) {
+export async function readRulesText() {
+  const raw = await fs.readFile(RULES_FILE, 'utf8');
+  const oneLine = raw
+    .replace(/^\uFEFF/, '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/[ \t]+/g, ' ');
+  return oneLine.length > RULES_LIMIT ? oneLine.slice(0, RULES_LIMIT) : oneLine;
+}
+
+/** 规则源的元信息（设置页卡片用），文件缺失不抛错 */
+export async function readRulesInfo() {
+  try {
+    const raw = await fs.readFile(RULES_FILE, 'utf8');
+    const text = await readRulesText();
+    return {
+      path: RULES_FILE,
+      exists: true,
+      sourceBytes: Buffer.byteLength(raw, 'utf8'),
+      sourceLines: raw.replace(/^\uFEFF/, '').split(/\r?\n/).filter((line) => line.trim()).length,
+      injectedChars: text.length,
+      truncated: text.length >= RULES_LIMIT,
+    };
+  } catch (error) {
+    if (error && error.code === 'ENOENT') {
+      return { path: RULES_FILE, exists: false, sourceBytes: 0, sourceLines: 0, injectedChars: 0, truncated: false };
+    }
+    throw error;
+  }
+}
+
+/** 开关「全局规则」：开 = 三个 prefix 行尾挂标记块，关 = 精确移除标记块，其余字符不动。 */
+export async function writeGlobalRules(enabled) {
   const file = patchPath();
   if (!existsSync(file)) throw new Error('找不到 profile patch：' + file);
 
   const text = await fs.readFile(file, 'utf8');
-  const next = enabled
-    ? text.replace(PERSONA_PREFIX_LINE_RE, (match) => (match.includes(ZH_SUFFIX) ? match : match + ' ' + ZH_SUFFIX))
-    : text.split(' ' + ZH_SUFFIX).join('').split("'" + ZH_SUFFIX + "'").join("''");
+  const withoutBlock = text.replace(RULES_RE, '');
+  let next = withoutBlock;
 
-  if (next === text) return { changed: false, backup: null };
-  if (enabled && !next.includes(ZH_SUFFIX)) {
-    throw new Error('补丁里没找到 persona 的 prefix 行，未做任何改动');
+  if (enabled) {
+    const body = await readRulesText();
+    if (!body) throw new Error('规则源文件为空：' + RULES_FILE);
+    const block = ' ' + RULES_START + ' ' + body + ' ' + RULES_END;
+    let hit = 0;
+    next = withoutBlock.replace(PERSONA_PREFIX_LINE_RE, (line) => {
+      hit += 1;
+      return line + block;
+    });
+    if (hit === 0) throw new Error('补丁里没找到 persona 的 prefix 行，未做任何改动');
   }
+
+  if (next === text) return { changed: false, backup: null, injectedPrefixes: enabled ? 3 : 0 };
 
   const bak = file + '.bak-lqconfig-' + stamp();
   await fs.copyFile(file, bak);
   await fs.writeFile(file, next, 'utf8');
-  return { changed: true, backup: bak };
+  return { changed: true, backup: bak, injectedPrefixes: enabled ? 3 : 0 };
 }
 
 async function restartApp() {
@@ -660,12 +704,21 @@ export function apply(ctx) {
               const result = await writeEnabled(body.enabled);
               return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
             }
-            if (req.method === 'POST' && route === '/api/chain-zh') {
+            if (req.method === 'GET' && route === '/api/global-rules') {
+              const info = await readRulesInfo();
+              const text = await fs.readFile(patchPath(), 'utf8');
+              return sendJson(res, 200, { ok: true, ...info, enabled: text.includes(RULES_START) });
+            }
+            if (req.method === 'POST' && route === '/api/global-rules') {
               const body = await readBody(req);
               if (typeof body.enabled !== 'boolean') {
                 return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
               }
-              const result = await writeChainZh(body.enabled);
+              const result = await writeGlobalRules(body.enabled);
+              return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
+            }
+            if (req.method === 'POST' && route === '/api/global-rules/sync') {
+              const result = await writeGlobalRules(true);
               return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
             }
             if (req.method === 'POST' && (route === '/api/native-setting' || route === '/api/native-open')) {

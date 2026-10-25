@@ -7,10 +7,11 @@
 - **隐藏 API**（滑块）：等价于在 `profiles/desktop/cordis.patch.yml` 写入
   `- id: llm-deepseek` + `disabled: true`。开启后设置页的「DeepSeek」卡片与
   模型选择器里的「DeepSeek」分组一起消失；DeepSeek 账号通道不受影响。
-- **思维链优先中文**（滑块）：把三个 Agent 预设（standard / ptc / cordis）里
-  `persona.suffix`（系统提示尾部）的 `''` 换成一句「内部思考用简体中文、技术
-  术语保留英文」的指令；关闭时还原为空。只动这 3 行，正则限定「10 空格缩进 +
-  `suffix: ''`」，不会误伤别的 `suffix`。
+- **全局规则**（滑块）：把插件目录 `GLOBAL-RULES.md` 的正文压成单行，追加到三个
+  Agent 预设（standard / ptc / cordis）的 `persona.prefix` 行尾（系统提示前段），用
+  `[[dsh-lqconfig:global-rules]] … [[/…]]` 标记块包裹；关闭时只移除标记块。规则正文
+  第一行就是「思考用简体中文」那句，原来的独立思维链开关已并入这里；源文件改完点
+  「重新注入」重写三处 `prefix`。
 - **打开资源管理器和程序**（滑块）：点聊天里的本地绝对路径链接时，同时请求资源管理器与默认程序。
   同一路径（文件按父目录比）已有资源管理器窗口时，先恢复并置顶该窗口——文件还会被选中并
   滚动到可见——不再新开；查不到才新开。查询失败或超时一律退回新开，点击不会失效。
@@ -41,7 +42,7 @@
 
 ## 结构
 
-- `index.js` —— 宿主半：`/dsh-lqconfig/api/state|set|chain-zh|native-setting|native-open|restart|proxy/*`
+- `index.js` —— 宿主半：`/dsh-lqconfig/api/state|set|global-rules|global-rules/sync|native-setting|native-open|restart|proxy/*`
 - `client.js` —— 浏览器半：`settings.section` 分区、`sidebar.footer.action` 代理状态徽标、`shell.overlay` 状态详情面板
 - `proxy.js` —— 代理模块：订阅解析、内核生命周期、按偏好选节点
 - `scripts/focus-explorer.ps1` —— 找同路径资源管理器窗口并置顶（`-Check` 只查不动）；解析输出单行 JSON
@@ -52,7 +53,7 @@
 
 - 个人插件，界面固定中文
 - 关掉「隐藏 API」同样即时保存，重启后恢复显示
-- 「思维链优先中文」只作用于系统提示，能显著提高中文思考比例，不能 100% 保证
+- 全局规则只作用于系统提示（`persona.prefix`），权重高于 AGENTS.md；正文第一行是思维链那句，能显著提高中文思考比例，但不能 100% 保证
 
 ## 打开资源管理器和程序
 
