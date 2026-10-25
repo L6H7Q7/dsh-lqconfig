@@ -365,9 +365,13 @@ window.__ModuleLoader__.load({
         publishNative({ notice: { ...nativeSnapshot.notice, id, busy: true } });
       }
       try {
-        await nativeJson('/native-open', { path: target, ...(operations ? { operations } : {}) });
+        const data = await nativeJson('/native-open', { path: target, ...(operations ? { operations } : {}) });
         if (!nativeDisposed && id === nativeNoticeSequence) {
-          publishNative({ message: '打开请求已提交；窗口是否出现尚未核实。', notice: null });
+          const explorer = data.explorer;
+          const message = explorer?.reused === true
+            ? '已切换到已打开的资源管理器窗口（未新建）' + (explorer.selected === true ? '，并选中目标文件。' : '。')
+            : '打开请求已提交；窗口是否出现尚未核实。';
+          publishNative({ message, notice: null });
         }
       } catch (error) {
         if (!nativeDisposed && id === nativeNoticeSequence) {
@@ -491,64 +495,132 @@ window.__ModuleLoader__.load({
 
 
     function VisibleShellCard() {
-      const [visible, setVisible] = useState(true);
-      const [saving, setSaving] = useState(false);
+      const [state, setState] = useState({
+        visible: true,
+        serviceWindow: true,
+        shutdownOnTurnEnd: true,
+        console: { enabled: true, push: true },
+      });
+      const [saving, setSaving] = useState('');
       const [message, setMessage] = useState('');
       const [tone, setTone] = useState('note');
+      const [runs, setRuns] = useState([]);
 
-      useEffect(() => {
-        let disposed = false;
-        (async () => {
-          try {
-            const res = await fetch('/visible-shell/api/state', { cache: 'no-store' });
-            const data = await res.json();
-            if (!data.ok) throw new Error(data.error || '读取失败');
-            if (!disposed) setVisible(data.visible !== false);
-          } catch (error) {
-            if (!disposed) {
-              setTone('warn');
-              setMessage('读取失败：' + String(error && error.message ? error.message : error));
-            }
-          }
-        })();
-        return () => { disposed = true; };
-      }, []);
+      function adopt(data) {
+        setState({
+          visible: data.visible !== false,
+          serviceWindow: data.serviceWindow !== false,
+          shutdownOnTurnEnd: data.shutdownOnTurnEnd !== false,
+          console: {
+            enabled: !(data.console && data.console.enabled === false),
+            push: !(data.console && data.console.push === false),
+          },
+        });
+      }
 
-      async function persist(next) {
-        setVisible(next);
-        setSaving(true);
-        setMessage('');
+      async function load() {
         try {
-          const res = await fetch('/visible-shell/api/visible', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ visible: next }),
-          });
+          const res = await fetch('/visible-shell/api/state', { cache: 'no-store' });
           const data = await res.json();
-          if (!data.ok) throw new Error(data.error || '保存失败');
-          setVisible(data.visible !== false);
-          setTone('ok');
-          setMessage('已保存，即时生效，无需重启。');
+          if (!data.ok) throw new Error(data.error || '读取失败');
+          adopt(data);
         } catch (error) {
-          setVisible(!next);
           setTone('warn');
-          setMessage('保存失败：' + String(error && error.message ? error.message : error));
-        } finally {
-          setSaving(false);
+          setMessage('读取失败：' + String(error && error.message ? error.message : error));
         }
       }
 
+      async function loadRuns() {
+        try {
+          const res = await fetch('/visible-shell/api/runs', { cache: 'no-store' });
+          const data = await res.json();
+          if (data.ok) setRuns(Array.isArray(data.runs) ? data.runs : []);
+        } catch { /* 状态徽标读不到不影响开关 */ }
+      }
+
+      useEffect(() => {
+        let disposed = false;
+        void load();
+        void loadRuns();
+        const timer = setInterval(() => {
+          if (disposed) return;
+          if (typeof document !== 'undefined' && document.hidden) return;
+          void loadRuns();
+        }, 5000);
+        return () => { disposed = true; clearInterval(timer); };
+      }, []);
+
+      async function persist(patch, key) {
+        setSaving(key);
+        setMessage('');
+        try {
+          const res = await fetch('/visible-shell/api/set', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(patch),
+          });
+          const data = await res.json();
+          if (!data.ok) throw new Error(data.error || '保存失败');
+          adopt(data);
+          setTone('ok');
+          setMessage('已保存，即时生效，无需重启。');
+        } catch (error) {
+          setTone('warn');
+          setMessage('保存失败：' + String(error && error.message ? error.message : error));
+          void load();
+        } finally {
+          setSaving('');
+        }
+      }
+
+      const running = runs.filter(run => run.status === 'running');
+
+      function block(label, desc, checked, onToggle, key) {
+        return [
+          el('div', { style: { ...S.head, marginTop: 14 } },
+            el('div', { style: S.title }, label),
+            el(Switch, {
+              checked,
+              disabled: Boolean(saving),
+              label,
+              onChange: event => { void onToggle(event.target.checked); },
+            })),
+          el('div', { style: S.desc }, desc),
+        ];
+      }
+
       return el('div', { style: S.card },
-        el('div', { style: S.head },
-          el('div', { style: S.title }, '命令窗口'),
-          el(Switch, {
-            checked: visible,
-            disabled: saving,
-            label: '命令窗口',
-            onChange: event => { void persist(event.target.checked); },
-          })),
-        el('div', { style: S.desc }, '开启后，DSH 执行每条命令都会弹出一个真实的终端窗口，命令跑完窗口自动关闭，输出经日志回传对话；关闭后恢复隐藏执行（与官方内置一致）。开关由 visible-shell 插件提供，读写它的 state.json，即时生效、不重启。'),
-        el('div', { style: S.status }, '当前：' + (visible ? '每条命令弹窗' : '隐藏执行') + (saving ? ' · 保存中…' : '')),
+        el('div', { style: S.title }, '命令执行'),
+        ...block('命令窗口',
+          '开启后，DSH 执行每条命令都会弹出一个真实的终端窗口，命令跑完窗口自动关闭，输出经日志回传对话；关闭后恢复隐藏执行（与官方内置一致）。开关由 visible-shell 插件提供，读写它的 state.json，即时生效、不重启。',
+          state.visible, next => persist({ visible: next }, 'visible'), 'visible'),
+        ...block('服务窗口',
+          '带 run_in_background 的命令（ComfyUI、codex CLI、任何常驻服务）窗口保留到对话结束；由 WMI 拉起，服务常驻也不会把工具调用吊死。',
+          state.serviceWindow, next => persist({ serviceWindow: next }, 'serviceWindow'), 'serviceWindow'),
+        ...block('对话结束自动关服务',
+          '一轮对话结束时关掉本会话启动的全部服务进程，释放显存与后台占用。只关本会话的，不影响别的对话。',
+          state.shutdownOnTurnEnd, next => persist({ shutdownOnTurnEnd: next }, 'shutdownOnTurnEnd'), 'shutdownOnTurnEnd'),
+        ...block('总控台',
+          '新对话自动打开一个命令总控台窗口，实时列出每条命令的开始时间、耗时与结果；对话结束时渲染成 PNG。',
+          state.console.enabled, next => persist({ console: { enabled: next } }, 'console'), 'console'),
+        el('div', { style: { ...S.desc, marginTop: 4 } },
+          el('label', { style: { display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' } },
+            el('input', {
+              type: 'checkbox',
+              checked: state.console.push,
+              disabled: !state.console.enabled || Boolean(saving),
+              onChange: event => { void persist({ console: { push: event.target.checked } }, 'push'); },
+            }),
+            '对话结束时把总控台截图连同结论推送到企业微信（由 wecom-notify 执行）')),
+        el('div', { style: S.status }, '当前：' + (state.visible ? '每条命令弹窗' : '隐藏执行')
+          + ' · 服务窗口' + (state.serviceWindow ? '开' : '关')
+          + ' · 对话结束' + (state.shutdownOnTurnEnd ? '关服务' : '不关')
+          + ' · 总控台' + (state.console.enabled ? '开' : '关')
+          + (state.console.push ? '（含推送）' : '')
+          + (saving ? ' · 保存中…' : '')),
+        running.length > 0
+          ? el('div', { style: S.note }, '运行中：' + running.map(run => (run.title || run.runId) + '（pid ' + run.pid + '）').join('、'))
+          : null,
         message ? el('div', { style: tone === 'warn' ? S.warn : tone === 'ok' ? S.ok : S.note }, message) : null);
     }
 
@@ -981,7 +1053,7 @@ window.__ModuleLoader__.load({
             el('div', { style: S.title }, '打开资源管理器和程序'),
             el(Switch, { checked: native.openNative, disabled: native.saving, label: '打开资源管理器和程序',
               onChange: event => { void saveNativeSettings(event.target.checked); } })),
-          el('div', { style: S.desc }, '开启后，点击聊天里的本地绝对路径链接，会保留 Sidebar 原有预览，同时请求资源管理器和默认程序打开该路径。资源管理器会选中文件或打开目录；两路分别报告结果。行号链接、相对路径和网页链接保持原有行为。'),
+          el('div', { style: S.desc }, '开启后，点击聊天里的本地绝对路径链接，会保留 Sidebar 原有预览，同时请求资源管理器和默认程序打开该路径。资源管理器会选中文件或打开目录；两路分别报告结果。同一路径（文件取父目录）已有资源管理器窗口时，直接置顶复用该窗口并在需要时选中文件，不再新开；查询不到才新开。行号链接、相对路径和网页链接保持原有行为。'),
           el('div', { style: S.status }, '当前：' + (native.openNative ? '已开启' : '未开启') + (native.saving ? ' · 保存中…' : '') + ' · 保存即时生效'),
           native.message ? el('div', { style: S.note }, native.message) : null,
           native.error ? el('div', { style: S.warn }, native.error) : null,

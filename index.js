@@ -351,9 +351,66 @@ function revealNativeLocation(target, directory, select) {
   });
 }
 
+// 复用已打开的资源管理器窗口：先查是否已有窗口正显示该路径（目录比同路径，
+// 文件比父目录），命中就恢复并置顶，不再新开；未命中才交给 explorer.exe。
+// 查询失败、超时或脚本缺失一律按未命中处理，最差退回原来的新开行为。
+const focusScriptPath = fileURLToPath(new URL('./scripts/focus-explorer.ps1', import.meta.url));
+const FOCUS_TIMEOUT_MS = 4000;
+
+async function focusExistingExplorer(target, mode, select) {
+  const executable = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', focusScriptPath, '-Target', target, '-Mode', mode];
+  if (select) args.push('-Select');
+  const env = { ...process.env };
+  // 同 launchNativePath：继承它会让孩子进程里的 GUI 程序退化成 Node。
+  delete env.ELECTRON_RUN_AS_NODE;
+  return new Promise((resolve) => {
+    let child, stdout = '', settled = false;
+    const finish = (value) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value); } };
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* 尽力而为 */ }
+      finish({ focused: false, reason: 'focus-timeout' });
+    }, FOCUS_TIMEOUT_MS);
+    try {
+      child = spawn(executable, args, {
+        windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'], env,
+      });
+    } catch (error) { finish({ focused: false, reason: error.message }); return; }
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', chunk => { stdout = (stdout + chunk).slice(-16384); });
+    child.stderr.on('data', () => { /* 只用于兜底诊断，不解析 */ });
+    child.on('error', error => finish({ focused: false, reason: error.message }));
+    child.on('close', (exitCode) => {
+      // 脚本只输出一行 JSON；前面可能混入 PowerShell 的告警，取最后一行。
+      const line = stdout.split(/\r?\n/u).map(item => item.trim()).filter(Boolean).pop() || '';
+      let data;
+      try { data = JSON.parse(line); } catch { finish({ focused: false, reason: 'focus-unparsable' }); return; }
+      if (data?.ok === true && data.found === true) {
+        finish({
+          focused: true,
+          hwnd: data.hwnd ?? null,
+          window: data.window ?? target,
+          foreground: data.foreground === true,
+          selected: data.selected === true,
+          scrolled: data.scrolled === true,
+        });
+        return;
+      }
+      if (data?.ok === true) { finish({ focused: false, reason: 'missing' }); return; }
+      finish({ focused: false, reason: data?.error || 'focus-exit-' + exitCode });
+    });
+  });
+}
 
 async function openExplorerForPath(target, stat, statError) {
-  if (stat?.isDirectory()) return revealNativeLocation(target, target, false);
+  const missing = statError?.code === 'ENOENT' || statError?.code === 'ENOTDIR';
+  if (stat?.isDirectory()) {
+    const existing = await focusExistingExplorer(target, 'directory', false);
+    if (existing.focused) return { status: 'focused', submitted: false, displayed: true, reused: true, ...existing };
+    return { ...(await revealNativeLocation(target, target, false)), reused: false };
+  }
   const parent = path.win32.dirname(target);
   const parentStat = await fs.stat(parent);
   if (!parentStat.isDirectory()) {
@@ -361,9 +418,10 @@ async function openExplorerForPath(target, stat, statError) {
     error.code = 'ENOTDIR';
     throw error;
   }
-  const missing = statError?.code === 'ENOENT' || statError?.code === 'ENOTDIR';
   // This is the independent Explorer intent, not recovery from an app failure.
-  return revealNativeLocation(target, parent, !missing);
+  const existing = await focusExistingExplorer(target, 'file', !missing);
+  if (existing.focused) return { status: 'focused', submitted: false, displayed: true, reused: true, ...existing };
+  return { ...(await revealNativeLocation(target, parent, !missing)), reused: false };
 }
 
 function nativeOperationError(error) {

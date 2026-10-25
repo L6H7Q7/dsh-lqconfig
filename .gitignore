@@ -2,3 +2,4 @@ state.json
 proxy.json
 proxy-data/
 *.bak-*
+vendor/

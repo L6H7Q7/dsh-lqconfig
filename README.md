@@ -11,6 +11,10 @@
   `persona.suffix`（系统提示尾部）的 `''` 换成一句「内部思考用简体中文、技术
   术语保留英文」的指令；关闭时还原为空。只动这 3 行，正则限定「10 空格缩进 +
   `suffix: ''`」，不会误伤别的 `suffix`。
+- **打开资源管理器和程序**（滑块）：点聊天里的本地绝对路径链接时，同时请求资源管理器与默认程序。
+  同一路径（文件按父目录比）已有资源管理器窗口时，先恢复并置顶该窗口——文件还会被选中并
+  滚动到可见——不再新开；查不到才新开。查询失败或超时一律退回新开，点击不会失效。
+  查找与置顶由 `scripts/focus-explorer.ps1` 完成，开关状态只写 `state.json`，改动代码需重启。
 - **代理（机场）**（卡片）：内置 mihomo 内核，按订阅节点与地区偏好提供按需代理。
 - **代理状态常驻显示**：侧边栏底部一枚状态徽标（圆点 + 当前节点），点开是详情面板；侧边栏折叠时只留圆点。
 - **改动即时保存**：拨动滑块立刻写补丁，并保留备份（`.bak-lqconfig-<时间戳>`）。
@@ -37,9 +41,11 @@
 
 ## 结构
 
-- `index.js` —— 宿主半：`/dsh-lqconfig/api/state|set|chain-zh|restart|proxy/*`
+- `index.js` —— 宿主半：`/dsh-lqconfig/api/state|set|chain-zh|native-setting|native-open|restart|proxy/*`
 - `client.js` —— 浏览器半：`settings.section` 分区、`sidebar.footer.action` 代理状态徽标、`shell.overlay` 状态详情面板
 - `proxy.js` —— 代理模块：订阅解析、内核生命周期、按偏好选节点
+- `scripts/focus-explorer.ps1` —— 找同路径资源管理器窗口并置顶（`-Check` 只查不动）；解析输出单行 JSON
+- `scripts/balance.ps1` —— 余额取数
 - `package.json` —— 声明 `dsh.client`
 
 ## 备注
@@ -47,6 +53,24 @@
 - 个人插件，界面固定中文
 - 关掉「隐藏 API」同样即时保存，重启后恢复显示
 - 「思维链优先中文」只作用于系统提示，能显著提高中文思考比例，不能 100% 保证
+
+## 打开资源管理器和程序
+
+点路径链接时宿主并行做两件事：默认程序打开该路径、资源管理器定位到它。资源管理器这一路会先「查重」：
+
+1. 目录比同路径；文件比父目录（命中后还要选中文件本身）。
+2. 命中：切到该标签 → `ShowWindow(SW_RESTORE)` → Alt + `AttachThreadInput` 组合强推前台（Win11 前台锁
+   会静默拒绝后台进程的 `SetForegroundWindow`）→ 文件再 `SelectItem` + UI Automation `ScrollIntoView`
+   滚动到可见 → 返回 `reused: true`，不再新开窗口。
+3. 未命中 / 脚本失败 / 4 秒超时：照旧 `explorer.exe` 新开，返回值带 `reused: false`。
+
+实测（Win11 build 26300）：标签页模式下每个标签是独立顶层 `CabinetWClass` 窗口，
+`Shell.Application.Windows()` 能分别返回它们的真实路径；最小化窗口依然可枚举；跨标签置顶、选中、
+滚动均生效。脚本单次耗时约 0.35–0.7 秒（PowerShell 冷启动 + `Add-Type` 编译）。
+
+`index.js` 的 `focusExistingExplorer()` 负责调脚本，`openExplorerForPath()` 决定「命中即返回、否则走原路径」。
+单独调试：`powershell -NoProfile -File scripts/focus-explorer.ps1 -Target 'D:\某目录' -Mode directory -Check`
+（`-Check` 只查询不置顶）。
 
 ## 代理（机场）
 
