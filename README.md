@@ -11,7 +11,12 @@
   Agent 预设（standard / ptc / cordis）的 `persona.prefix` 行尾（系统提示前段），用
   `[[dsh-lqconfig:global-rules]] … [[/…]]` 标记块包裹；关闭时只移除标记块。规则正文
   第一行就是「思考用简体中文」那句，原来的独立思维链开关已并入这里；源文件改完点
-  「重新注入」重写三处 `prefix`。
+  「重新注入」重写三处 `prefix`，点「打开目录」在资源管理器里定位该文件。
+- **觉醒模式**（滑块，默认关闭）：开启后用 `AWAKENING-PROMPT.txt` 的完整正文替换三个
+  Agent 预设的 `persona.prefix`，并把原来的三行保存到 `awakening-original.json`；关闭后
+  从快照逐字恢复。每次实际修改前备份 `cordis.patch.yml`，保存后自动重启。开启期间锁定
+  「全局规则」开关和重新注入按钮，防止两项设置互相覆盖。卡片上的「打开目录」按钮在
+  资源管理器中打开插件目录并选中 `AWAKENING-PROMPT.txt`，改完正文再拨一次开关即可重新载入。
 - **打开资源管理器和程序**（滑块）：点聊天里的本地绝对路径链接时，同时请求资源管理器与默认程序。
   同一路径（文件按父目录比）已有资源管理器窗口时，先恢复并置顶该窗口——文件还会被选中并
   滚动到可见——不再新开；查不到才新开。查询失败或超时一律退回新开，点击不会失效。
@@ -42,7 +47,8 @@
 
 ## 结构
 
-- `index.js` —— 宿主半：`/dsh-lqconfig/api/state|set|global-rules|global-rules/sync|native-setting|native-open|restart|proxy/*`
+- `index.js` —— 宿主半：`/dsh-lqconfig/api/state|set|global-rules|global-rules/sync|awakening|reveal|native-setting|native-open|restart|proxy/*`
+- `AWAKENING-PROMPT.txt` —— 觉醒模式的提示词原文；`awakening-original.json` 是运行时恢复快照，不纳入 Git
 - `client.js` —— 浏览器半：`settings.section` 分区、`sidebar.footer.action` 代理状态徽标、`shell.overlay` 状态详情面板
 - `proxy.js` —— 代理模块：订阅解析、内核生命周期、按偏好选节点
 - `scripts/focus-explorer.ps1` —— 找同路径资源管理器窗口并置顶（`-Check` 只查不动）；解析输出单行 JSON

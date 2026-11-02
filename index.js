@@ -41,6 +41,11 @@ const RULES_END = '[[/dsh-lqconfig:global-rules]]';
 const RULES_LIMIT = 16000;
 const RULES_RE = / ?\[\[dsh-lqconfig:global-rules\]\][\s\S]*?\[\[\/dsh-lqconfig:global-rules\]\]/g;
 
+const AWAKENING_FILE = fileURLToPath(new URL('./AWAKENING-PROMPT.txt', import.meta.url));
+const AWAKENING_SNAPSHOT = fileURLToPath(new URL('./awakening-original.json', import.meta.url));
+const AWAKENING_MARKER = '# dsh-lqconfig:awakening';
+const AWAKENING_PRESETS = ['standard', 'ptc', 'cordis'];
+
 function dshHome() {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 }
@@ -73,6 +78,19 @@ function stamp() {
 
 // Native opening belongs to this plugin; it does not alter the profile patch.
 const nativeStatePath = fileURLToPath(new URL('./state.json', import.meta.url));
+
+/** apply() 时的宿主上下文：强制终止与运行时长接口按需取用 Host 服务（不在 apply 里硬依赖）。 */
+let pluginContext = null;
+
+function hostService(name) {
+  if (!pluginContext) return undefined;
+  try {
+    const service = pluginContext.get(name);
+    return service || undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export async function readNativeSettings() {
   let text;
@@ -123,6 +141,20 @@ export async function readBalanceInterval() {
   const value = await readStateFile();
   const minutes = Number(value.balanceIntervalMinutes);
   return Number.isFinite(minutes) && minutes >= 1 && minutes <= 60 ? Math.round(minutes) : 1;
+}
+
+// 会话强制终止开关：默认开启；state.json 里缺键时也视为开启
+export async function readForceStopEnabled() {
+  const value = await readStateFile();
+  return typeof value.forceStop === 'boolean' ? value.forceStop : true;
+}
+
+export async function writeForceStopEnabled(enabled) {
+  if (typeof enabled !== 'boolean') throw new Error('enabled 必须是布尔值');
+  const current = await readStateFile();
+  current.forceStop = enabled;
+  await fs.writeFile(nativeStatePath, JSON.stringify(current, null, 2) + '\n', 'utf8');
+  return { forceStop: enabled };
 }
 
 export async function writeBalanceInterval(minutes) {
@@ -486,6 +518,208 @@ export async function openNativePath(value, operations = ['program', 'explorer']
 }
 
 
+/* ---------------- 当前 Turn 运行时长 + 强制终止（Host 侧） ---------------- */
+
+const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+
+export function isSessionId(value) {
+  return typeof value === 'string' && SESSION_ID_RE.test(value);
+}
+
+const turnClockCache = new Map();
+const TURN_CLOCK_CACHE_MS = 3000;
+/** 运行中读事件找 turn 起点较重：同一轮内 30 秒才重读一次，其余时间复用上次起点。 */
+const TURN_START_REFRESH_MS = 30000;
+
+function lastTurnStart(events) {
+  if (!Array.isArray(events)) return 0;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (!event || event.type !== 'turn/start') continue;
+    const time = Number(event.time);
+    return Number.isFinite(time) && time > 0 ? time : 0;
+  }
+  return 0;
+}
+
+/** 读当前会话的「是否在运行 + 本 turn 起点」：列表定运行态，事件定起点，结果缓存 3 秒。 */
+export async function readTurnClock(sessionId) {
+  const now = Date.now();
+  const cached = turnClockCache.get(sessionId);
+  if (cached && now - cached.at < TURN_CLOCK_CACHE_MS) {
+    return { ...cached.value, cached: true, serverNow: now };
+  }
+
+  const report = { running: false, startedAt: 0, source: 'none' };
+  const controller = hostService('sessionController');
+  if (!controller) {
+    report.source = 'unavailable';
+    turnClockCache.set(sessionId, { at: now, value: report, inspectedAt: 0 });
+    return { ...report, cached: false, serverNow: now };
+  }
+
+  try {
+    const signal = new AbortController().signal;
+    const listed = await controller.list({}, signal);
+    const items = listed && Array.isArray(listed.items) ? listed.items : [];
+    const summary = items.find((item) => item && item.sessionId === sessionId);
+    report.running = Boolean(summary && summary.running === true);
+    report.source = 'list';
+  } catch (error) {
+    report.error = error instanceof Error ? error.message : String(error);
+  }
+
+  let inspectedAt = cached ? cached.inspectedAt : 0;
+  let startedAt = cached ? cached.value.startedAt : 0;
+
+  if (report.running) {
+    const stale = !startedAt || now - inspectedAt >= TURN_START_REFRESH_MS;
+    if (stale) {
+      try {
+        const inspection = await controller.inspect(sessionId);
+        startedAt = lastTurnStart(inspection && inspection.events);
+        inspectedAt = now;
+        report.source = 'inspect';
+      } catch (error) {
+        report.error = error instanceof Error ? error.message : String(error);
+        startedAt = 0;
+      }
+    }
+    if (!startedAt) startedAt = now;
+    report.startedAt = startedAt;
+  }
+
+  turnClockCache.set(sessionId, { at: now, value: report, inspectedAt });
+  return { ...report, cached: false, serverNow: now };
+}
+
+/** 终端服务可能只挂在 Agent 作用域（预设内提供）：先取根，再按 Agent 取作用域。 */
+function resolveTerminals(agent) {
+  const root = hostService('terminals');
+  if (root) return { terminals: root, source: 'root' };
+  if (!agent) return { terminals: undefined, source: '' };
+  const presets = hostService('agentPresets');
+  if (presets && typeof presets.serviceFor === 'function') {
+    try {
+      const scoped = presets.serviceFor(agent, 'terminals');
+      if (scoped) return { terminals: scoped, source: 'agent-scope' };
+    } catch { /* 作用域不提供 terminals */ }
+  }
+  return { terminals: undefined, source: '' };
+}
+
+/**
+ * 强制终止：先发官方中止信号，再把可能拖着不放的三层一起收掉——
+ * 后台任务（jobs.kill）、终端进程（terminals.kill）、子代理（subagents.interrupt）。
+ * 每层独立 try/catch：服务缺失或某层拒绝只记录，不影响其余步骤。
+ */
+export async function forceStopSession(sessionId) {
+  const steps = [];
+  const pushStep = (name, detail, ok) => { steps.push({ name, ok: ok === true, detail }); };
+
+  const controller = hostService('sessionController');
+  if (!controller) {
+    pushStep('cancel', 'sessionController 不可用', false);
+  } else {
+    try {
+      const value = controller.cancel({ sessionId });
+      const accepted = Boolean(value && value.accepted === true);
+      pushStep('cancel', accepted ? '已发出中止信号' : '中止请求未被接受', accepted);
+    } catch (error) {
+      pushStep('cancel', error instanceof Error ? error.message : String(error), false);
+    }
+  }
+
+  const jobs = hostService('jobs');
+  if (!jobs) {
+    pushStep('jobs', 'jobs 服务不可用', false);
+  } else {
+    try {
+      const views = jobs.list(sessionId) || [];
+      let requested = 0;
+      for (const view of views) {
+        const id = view && (view.id ?? view.jobId);
+        if (!id) continue;
+        try {
+          if (jobs.kill(id, sessionId, 'force-stop') === 'requested') requested += 1;
+        } catch { /* 单个任务失败不影响其余 */ }
+      }
+      pushStep('jobs', '后台任务 ' + views.length + ' 个，已请求终止 ' + requested + ' 个', true);
+    } catch (error) {
+      pushStep('jobs', error instanceof Error ? error.message : String(error), false);
+    }
+  }
+
+  const agents = hostService('agents');
+  const agent = agents && typeof agents.get === 'function' ? agents.get(sessionId) : undefined;
+
+  if (!agent) {
+    pushStep('terminals', '该会话没有常驻 Agent，跳过', true);
+  } else {
+    const resolved = resolveTerminals(agent);
+    if (resolved.terminals) {
+      try {
+        const sessions = resolved.terminals.list(agent) || [];
+        let killed = 0;
+        for (const item of sessions) {
+          const id = item && (item.id ?? item.terminalId ?? item.sessionId);
+          if (!id) continue;
+          try {
+            await resolved.terminals.kill(agent, id, 'force-stop');
+            killed += 1;
+          } catch { /* 单个终端失败不影响其余 */ }
+        }
+        pushStep('terminals', '终端 ' + sessions.length + ' 个，已终止 ' + killed + ' 个（来源 ' + resolved.source + '）', true);
+      } catch (error) {
+        pushStep('terminals', error instanceof Error ? error.message : String(error), false);
+      }
+    } else {
+      // 最后兜底：Web 终端控制器（侧边栏终端），不是模型 shell，但能关掉界面上的终端会话
+      const controller = hostService('terminalController');
+      if (!controller || typeof controller.list !== 'function' || typeof controller.close !== 'function') {
+        pushStep('terminals', 'terminals 服务不可用（根、Agent 作用域、控制器都没有）', false);
+      } else {
+        try {
+          const list = controller.list(sessionId) || [];
+          let closed = 0;
+          for (const item of list) {
+            const id = item && (item.id ?? item.terminalId);
+            if (!id) continue;
+            try { await controller.close(agent, id); closed += 1; } catch { /* 单个失败忽略 */ }
+          }
+          pushStep('terminals', '终端控制器关闭 ' + closed + '/' + list.length + ' 个（来源 terminalController）', true);
+        } catch (error) {
+          pushStep('terminals', error instanceof Error ? error.message : String(error), false);
+        }
+      }
+    }
+  }
+
+  const subagents = hostService('subagents');
+  if (!subagents) {
+    pushStep('subagents', 'subagents 服务不可用', false);
+  } else {
+    try {
+      const children = (await subagents.listChildren(sessionId)) || [];
+      let interrupted = 0;
+      for (const child of children) {
+        const id = child && child.id;
+        if (!id) continue;
+        try {
+          subagents.interrupt(id, { kind: 'user', parentSessionId: sessionId });
+          interrupted += 1;
+        } catch { /* 单个子代理失败不影响其余 */ }
+      }
+      pushStep('subagents', '子代理 ' + children.length + ' 个，已中断 ' + interrupted + ' 个', true);
+    } catch (error) {
+      pushStep('subagents', error instanceof Error ? error.message : String(error), false);
+    }
+  }
+
+  turnClockCache.delete(sessionId);
+  return { steps };
+}
+
 export async function readState() {
   const file = patchPath();
   const exists = existsSync(file);
@@ -493,9 +727,13 @@ export async function readState() {
   return {
     enabled: !text.includes(BLOCK_START),
     globalRules: text.includes(RULES_START),
+    awakening: text.includes(AWAKENING_MARKER),
+    awakeningPath: AWAKENING_FILE,
+    rulesPath: RULES_FILE,
     ...(await readNativeSettings()),
     balanceBadge: await readBalanceBadge(),
     balanceIntervalMinutes: await readBalanceInterval(),
+    forceStop: await readForceStopEnabled(),
     exists,
     patchPath: file,
     exe: exePath(),
@@ -574,6 +812,7 @@ export async function writeGlobalRules(enabled) {
   if (!existsSync(file)) throw new Error('找不到 profile patch：' + file);
 
   const text = await fs.readFile(file, 'utf8');
+  if (text.includes(AWAKENING_MARKER)) throw new Error('请先关闭觉醒模式，再修改全局规则');
   const withoutBlock = text.replace(RULES_RE, '');
   let next = withoutBlock;
 
@@ -595,6 +834,89 @@ export async function writeGlobalRules(enabled) {
   await fs.copyFile(file, bak);
   await fs.writeFile(file, next, 'utf8');
   return { changed: true, backup: bak, injectedPrefixes: enabled ? 3 : 0 };
+}
+
+function awakeningRanges(text, active) {
+  const found = [];
+  const starts = [...text.matchAll(/^- id: preset-(standard|ptc|cordis)\r?$/gm)];
+  for (const preset of AWAKENING_PRESETS) {
+    const start = starts.find(match => match[1] === preset);
+    if (!start) throw new Error('补丁缺少 Agent 预设：' + preset);
+    const next = text.indexOf('\n- id:', start.index + start[0].length);
+    const end = next < 0 ? text.length : next + 1;
+    const section = text.slice(start.index, end);
+    const expression = active
+      ? /^ {10}prefix: \|- # dsh-lqconfig:awakening\r?\n(?: {12}[^\r\n]*(?:\r?\n|$))*/gm
+      : /^ {10}prefix: [^\r\n]*(?:\r?\n|$)/gm;
+    const matches = [...section.matchAll(expression)];
+    if (matches.length !== 1) throw new Error('预设 ' + preset + ' 的 persona.prefix 状态异常，未做任何改动');
+    found.push({ preset, start: start.index + matches[0].index, end: start.index + matches[0].index + matches[0][0].length, original: matches[0][0] });
+  }
+  return found;
+}
+
+function replaceAwakeningRanges(text, ranges, replacement) {
+  let next = text;
+  for (const range of [...ranges].reverse()) {
+    next = next.slice(0, range.start) + replacement(range) + next.slice(range.end);
+  }
+  return next;
+}
+
+export async function writeAwakening(enabled) {
+  if (typeof enabled !== 'boolean') throw new Error('enabled 必须是布尔值');
+  const file = patchPath();
+  if (!existsSync(file)) throw new Error('找不到 profile patch：' + file);
+  const text = await fs.readFile(file, 'utf8');
+  const active = text.includes(AWAKENING_MARKER);
+  if (active === enabled) return { changed: false, backup: null };
+
+  let next;
+  if (enabled) {
+    const source = (await fs.readFile(AWAKENING_FILE, 'utf8')).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').trimEnd();
+    if (!source.trim()) throw new Error('觉醒模式提示词文件为空');
+    const ranges = awakeningRanges(text, false);
+    const newline = text.includes('\r\n') ? '\r\n' : '\n';
+    const block = '          prefix: |- ' + AWAKENING_MARKER + newline
+      + source.split('\n').map(line => '            ' + line).join(newline) + newline;
+    next = replaceAwakeningRanges(text, ranges, () => block);
+    const snapshot = { version: 1, prefixes: Object.fromEntries(ranges.map(range => [range.preset, range.original])) };
+    const bak = file + '.bak-lqconfig-' + stamp();
+    await fs.copyFile(file, bak);
+    await fs.writeFile(AWAKENING_SNAPSHOT, JSON.stringify(snapshot, null, 2) + '\n', 'utf8');
+    await fs.writeFile(file, next, 'utf8');
+    return { changed: true, backup: bak };
+  }
+
+  const snapshot = JSON.parse(await fs.readFile(AWAKENING_SNAPSHOT, 'utf8'));
+  if (snapshot.version !== 1 || !snapshot.prefixes || AWAKENING_PRESETS.some(preset => typeof snapshot.prefixes[preset] !== 'string')) {
+    throw new Error('觉醒模式原提示词快照无效，未做任何改动');
+  }
+  const ranges = awakeningRanges(text, true);
+  next = replaceAwakeningRanges(text, ranges, range => snapshot.prefixes[range.preset]);
+  const bak = file + '.bak-lqconfig-' + stamp();
+  await fs.copyFile(file, bak);
+  await fs.writeFile(file, next, 'utf8');
+  return { changed: true, backup: bak };
+}
+
+/**
+ * 提示词源文件的「更新入口」：在资源管理器中打开所在目录并选中源文件。
+ * target = 'awakening' → AWAKENING-PROMPT.txt；'rules' → GLOBAL-RULES.md。
+ * 只做定位，不改任何内容；改完文本后由用户自行拨开关或点「重新注入」。
+ */
+const REVEAL_TARGETS = { awakening: AWAKENING_FILE, rules: RULES_FILE };
+
+export async function revealPromptSource(target) {
+  if (!Object.prototype.hasOwnProperty.call(REVEAL_TARGETS, target)) {
+    throw new Error('target 只能是 awakening 或 rules');
+  }
+  const file = REVEAL_TARGETS[target];
+  if (!existsSync(file)) throw new Error('源文件不存在：' + file);
+  if (process.platform !== 'win32') throw new Error('当前平台不支持资源管理器定位：' + process.platform);
+  // explorer 的 /select 需整段作为一个参数；即使成功也可能返回退出码 1，故不校验退出码
+  spawn('explorer.exe', ['/select,' + file], { detached: true, stdio: 'ignore' }).unref();
+  return { target, path: file, dir: path.dirname(file) };
 }
 
 async function restartApp() {
@@ -641,6 +963,8 @@ let exitHookInstalled = false;
 const WARMUP_DELAY_MS = 8000;
 
 export function apply(ctx) {
+  pluginContext = ctx;
+  ctx.effect(() => () => { if (pluginContext === ctx) pluginContext = null; }, 'dsh-lqconfig: host context');
   // 插件卸载时停掉内核，避免遗留孤儿进程
   ctx.effect(() => () => { proxy.stopSync(); }, 'dsh-lqconfig: proxy cleanup');
 
@@ -721,6 +1045,22 @@ export function apply(ctx) {
               const result = await writeGlobalRules(true);
               return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
             }
+            if (req.method === 'POST' && route === '/api/awakening') {
+              const body = await readBody(req);
+              if (typeof body.enabled !== 'boolean') {
+                return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+              }
+              const result = await writeAwakening(body.enabled);
+              return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
+            }
+            if (req.method === 'POST' && route === '/api/reveal') {
+              const body = await readBody(req);
+              try {
+                return sendJson(res, 200, { ok: true, ...(await revealPromptSource(body.target)) });
+              } catch (error) {
+                return sendJson(res, 400, { ok: false, error: String(error && error.message ? error.message : error) });
+              }
+            }
             if (req.method === 'POST' && (route === '/api/native-setting' || route === '/api/native-open')) {
               if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) {
                 return sendJson(res, 415, { ok: false, error: '此接口需要 application/json' });
@@ -788,6 +1128,35 @@ export function apply(ctx) {
                 return sendJson(res, 200, { ok: true, ...(await proxy.stop()) });
               }
               return sendJson(res, 404, { ok: false, error: 'not found' });
+            }
+            if (req.method === 'GET' && route === '/api/diag') {
+              const names = ['sessionController', 'jobs', 'terminals', 'agents', 'subagents', 'agentPresets', 'terminalController', 'approval'];
+              const services = {};
+              for (const name of names) services[name] = Boolean(hostService(name));
+              const sessionId = url.searchParams.get('sessionId') || '';
+              let scope = null;
+              if (isSessionId(sessionId)) {
+                const agents = hostService('agents');
+                const agent = agents && typeof agents.get === 'function' ? agents.get(sessionId) : undefined;
+                scope = { agent: Boolean(agent), terminalsSource: agent ? resolveTerminals(agent).source : '' };
+              }
+              return sendJson(res, 200, { ok: true, services, scope });
+            }
+            if (req.method === 'GET' && route === '/api/turn-clock') {
+              const sessionId = url.searchParams.get('sessionId') || '';
+              if (!isSessionId(sessionId)) return sendJson(res, 400, { ok: false, error: 'sessionId 无效' });
+              return sendJson(res, 200, { ok: true, ...(await readTurnClock(sessionId)) });
+            }
+            if (req.method === 'POST' && route === '/api/force-stop') {
+              const body = await readBody(req);
+              if (!isSessionId(body.sessionId)) return sendJson(res, 400, { ok: false, error: 'sessionId 无效' });
+              const result = await forceStopSession(body.sessionId);
+              return sendJson(res, 200, { ok: true, sessionId: body.sessionId, ...result });
+            }
+            if (req.method === 'POST' && route === '/api/force-stop-setting') {
+              const body = await readBody(req);
+              if (typeof body.enabled !== 'boolean') return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+              return sendJson(res, 200, { ok: true, ...(await writeForceStopEnabled(body.enabled)), ...(await readState()) });
             }
             if (req.method === 'POST' && route === '/api/restart') {
               return sendJson(res, 200, { ok: true, ...(await restartApp()) });

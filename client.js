@@ -919,6 +919,8 @@ window.__ModuleLoader__.load({
 
     function LqSection() {
       const native = useNativeState();
+      const forceStop = useForceStopSetting();
+      const [forceStopMessage, setForceStopMessage] = useState('');
       const [patchPath, setPatchPath] = useState('');
       const [hidden, setHidden] = useState(false);
       const [saving, setSaving] = useState(false);
@@ -930,6 +932,12 @@ window.__ModuleLoader__.load({
       const [rulesMessage, setRulesMessage] = useState('');
       const [rulesTone, setRulesTone] = useState('note');
       const [rulesInfo, setRulesInfo] = useState(null);
+      const [awakening, setAwakening] = useState(false);
+      const [awakeningSaving, setAwakeningSaving] = useState(false);
+      const [awakeningMessage, setAwakeningMessage] = useState('');
+      const [awakeningTone, setAwakeningTone] = useState('note');
+      const [awakeningPath, setAwakeningPath] = useState('');
+      const [revealing, setRevealing] = useState('');
 
 
       useEffect(() => { void load(); }, []);
@@ -941,6 +949,8 @@ window.__ModuleLoader__.load({
           if (!data.ok) throw new Error(data.error || '读取失败');
           setHidden(!data.enabled);
           setRules(Boolean(data.globalRules));
+          setAwakening(Boolean(data.awakening));
+          setAwakeningPath(data.awakeningPath || '');
           setPatchPath(data.patchPath || '');
           try {
             const infoRes = await fetch(API + '/global-rules', { cache: 'no-store' });
@@ -1016,6 +1026,60 @@ window.__ModuleLoader__.load({
         }
       }
 
+      async function persistAwakening(next) {
+        setAwakeningSaving(true);
+        setAwakeningMessage('');
+        try {
+          const res = await fetch(API + '/awakening', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ enabled: next }),
+          });
+          const data = await res.json();
+          if (!data.ok) throw new Error(data.error || '保存失败');
+          setAwakening(Boolean(data.awakening));
+          if (data.changed) {
+            await restartAt('awakening');
+            return;
+          }
+          setAwakeningMessage('没有变化，无需重启。');
+          setAwakeningTone('note');
+          setAwakeningSaving(false);
+        } catch (error) {
+          setAwakening(!next);
+          setAwakeningMessage('保存失败：' + String(error && error.message ? error.message : error));
+          setAwakeningTone('warn');
+          setAwakeningSaving(false);
+        }
+      }
+
+      /**
+       * 提示词更新入口：在资源管理器里打开源文件所在目录并选中它。
+       * which: 'rules' → GLOBAL-RULES.md；'awakening' → AWAKENING-PROMPT.txt。
+       * 只定位不改内容，用户改完文本再拨开关或点「重新注入」。
+       */
+      async function reveal(which) {
+        setRevealing(which);
+        const setM = which === 'rules' ? setRulesMessage : setAwakeningMessage;
+        const setT = which === 'rules' ? setRulesTone : setAwakeningTone;
+        setM('');
+        try {
+          const res = await fetch(API + '/reveal', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ target: which }),
+          });
+          const data = await res.json();
+          if (!data.ok) throw new Error(data.error || '打开失败');
+          setM('已在资源管理器中打开：' + data.dir + '（已选中 ' + (data.path || '').split(/[\\/]/).pop() + '）');
+          setT('ok');
+        } catch (error) {
+          setM('打开目录失败：' + String(error && error.message ? error.message : error));
+          setT('warn');
+        }
+        setRevealing('');
+      }
+
       function onToggleRules(event) {
         const next = event.target.checked;
         setRules(next);
@@ -1046,9 +1110,9 @@ window.__ModuleLoader__.load({
 
       /** which: 'api' | 'rules' —— 重启状态显示在触发它的那张卡片上 */
       async function restartAt(which) {
-        const setS = which === 'rules' ? setRulesSaving : setSaving;
-        const setM = which === 'rules' ? setRulesMessage : setMessage;
-        const setT = which === 'rules' ? setRulesTone : setTone;
+        const setS = which === 'awakening' ? setAwakeningSaving : which === 'rules' ? setRulesSaving : setSaving;
+        const setM = which === 'awakening' ? setAwakeningMessage : which === 'rules' ? setRulesMessage : setMessage;
+        const setT = which === 'awakening' ? setAwakeningTone : which === 'rules' ? setRulesTone : setTone;
         setS(true);
         setM('正在重启，页面稍后会断开…');
         setT('note');
@@ -1073,7 +1137,7 @@ window.__ModuleLoader__.load({
         el('div', { style: S.card },
           el('div', { style: S.head },
             el('div', { style: S.title }, '全局规则'),
-            el(Switch, { checked: rules, disabled: rulesSaving, label: '全局规则', onChange: onToggleRules })),
+            el(Switch, { checked: rules, disabled: rulesSaving || awakening || awakeningSaving, label: '全局规则', onChange: onToggleRules })),
           el('div', { style: S.desc }, '开启后，把插件目录 GLOBAL-RULES.md 的正文压成单行，注入三个 Agent 预设的 persona.prefix（系统提示前段）；关闭时只移除标记块，其余字符不动。改动写进 profile 补丁，拨动开关即自动重启生效；源文件改完点「重新注入」。'),
           el('div', { style: S.status }, '当前：' + (rules ? '已注入 3/3 个预设' : '未注入') + (rulesSaving ? ' · 处理中…' : '')
             + (rulesInfo && rulesInfo.exists
@@ -1081,9 +1145,21 @@ window.__ModuleLoader__.load({
               : ' · 源文件缺失')),
           rulesInfo && rulesInfo.truncated ? el('div', { style: S.warn }, '源文件超出单行注入上限，注入时已截断。') : null,
           rulesMessage ? el('div', { style: rulesTone === 'warn' ? S.warn : rulesTone === 'ok' ? S.ok : S.note }, rulesMessage) : null,
-          el('div', { style: { marginTop: 10 } },
-            el('button', { style: S.btn, disabled: rulesSaving || !rules, onClick: () => { void syncRules(); } }, '重新注入')),
+          el('div', { style: { marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' } },
+            el('button', { style: S.btn, disabled: rulesSaving || !rules || awakening || awakeningSaving, onClick: () => { void syncRules(); } }, '重新注入'),
+            el('button', { style: S.btn, disabled: revealing === 'rules', onClick: () => { void reveal('rules'); } }, revealing === 'rules' ? '打开中…' : '打开目录')),
           rulesInfo ? el('div', { style: S.mono }, '源：' + rulesInfo.path) : null),
+        el('div', { style: S.card },
+          el('div', { style: S.head },
+            el('div', { style: S.title }, '觉醒模式'),
+            el(Switch, { checked: awakening, disabled: awakeningSaving || rulesSaving, label: '觉醒模式',
+              onChange: event => { const next = event.target.checked; setAwakening(next); void persistAwakening(next); } })),
+          el('div', { style: S.desc }, '开启后，用 AWAKENING-PROMPT.txt 的完整内容替换三个 Agent 预设的 persona.prefix；关闭后从原文快照逐字恢复。保存后自动重启。开启期间暂时锁定「全局规则」，避免互相覆盖。改完提示词再拨一次开关（或重开）即可重新载入。'),
+          el('div', { style: S.status }, '当前：' + (awakening ? '已开启' : '未开启') + (awakeningSaving ? ' · 处理中…' : '')),
+          awakeningMessage ? el('div', { style: awakeningTone === 'warn' ? S.warn : awakeningTone === 'ok' ? S.ok : S.note }, awakeningMessage) : null,
+          el('div', { style: { marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' } },
+            el('button', { style: S.btn, disabled: revealing === 'awakening', onClick: () => { void reveal('awakening'); } }, revealing === 'awakening' ? '打开中…' : '打开目录')),
+          el('div', { style: S.mono }, '源：' + (awakeningPath || '（未知）'))),
         el('div', { style: S.card },
           el('div', { style: S.head },
             el('div', { style: S.title }, '打开资源管理器和程序'),
@@ -1094,6 +1170,21 @@ window.__ModuleLoader__.load({
           native.message ? el('div', { style: S.note }, native.message) : null,
           native.error ? el('div', { style: S.warn }, native.error) : null,
           native.compatibility ? el('div', { style: S.warn }, native.compatibility) : null),
+        el('div', { style: S.card },
+          el('div', { style: S.head },
+            el('div', { style: S.title }, '强制终止当前任务'),
+            el(Switch, {
+              checked: forceStop.enabled,
+              label: '强制终止当前任务',
+              onChange: event => {
+                const next = event.target.checked;
+                setForceStopMessage('');
+                void saveForceStopSetting(next).then(problem => setForceStopMessage(problem ? '保存失败：' + problem : '已保存，即时生效。'));
+              },
+            })),
+          el('div', { style: S.desc }, '开启后，对话输入框下方的状态栏多一条「运行时长 + 强制终止」：运行时长按本轮 turn 的真实起点计时（刷新页面不跳表）；点「强制终止」需点两次确认，会先发官方中止信号，再清理该会话的后台任务、终端进程和子代理，用来对付「暂停按了没反应」的卡住。关闭后这条状态栏完全不显示。'),
+          el('div', { style: S.status }, '当前：' + (forceStop.enabled ? '已开启' : '未开启') + ' · 保存即时生效'),
+          forceStopMessage ? el('div', { style: S.note }, forceStopMessage) : null),
         el(VisibleShellCard, {}),
         el(ProxyCard, {}),
         el(BalanceCard, {}),
@@ -1284,6 +1375,179 @@ window.__ModuleLoader__.load({
     }
 
     /** 输入框下方统计行里的代理状态胶囊（🟢 代理中 / 🟡 未代理 / 🔴 故障），点击打开 LQ配置 */
+    /* ---------------- 强制终止：开关 + 对话下方状态栏的运行时长 ---------------- */
+    let forceStopSnapshot = { enabled: true, loaded: false };
+    const forceStopSubscribers = new Set();
+    function publishForceStop(patch) {
+      forceStopSnapshot = { ...forceStopSnapshot, ...patch };
+      for (const listener of [...forceStopSubscribers]) listener();
+    }
+    function useForceStopSetting() {
+      return React.useSyncExternalStore(
+        React.useCallback(listener => { forceStopSubscribers.add(listener); return () => forceStopSubscribers.delete(listener); }, []),
+        () => forceStopSnapshot,
+      );
+    }
+    async function loadForceStopSetting() {
+      try {
+        const response = await fetch(API + '/state', { cache: 'no-store' });
+        const data = await response.json();
+        if (data && data.ok) publishForceStop({ enabled: data.forceStop !== false, loaded: true });
+      } catch { /* 读不到时保持默认开启 */ }
+    }
+    async function saveForceStopSetting(enabled) {
+      publishForceStop({ enabled });
+      try {
+        const response = await fetch(API + '/force-stop-setting', {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ enabled }),
+        });
+        const data = await response.json();
+        if (!data || !data.ok) throw new Error((data && data.error) || ('HTTP ' + response.status));
+        publishForceStop({ enabled: data.forceStop !== false });
+        return '';
+      } catch (error) {
+        publishForceStop({ enabled: !enabled });
+        return String(error && error.message ? error.message : error);
+      }
+    }
+
+    function formatRunDuration(startedAt, now) {
+      const total = Math.max(0, Math.floor((now - startedAt) / 1000));
+      const minutes = Math.floor(total / 60);
+      const seconds = total % 60;
+      const hours = Math.floor(minutes / 60);
+      const pad = value => String(value).padStart(2, '0');
+      return hours > 0 ? hours + ':' + pad(minutes % 60) + ':' + pad(seconds) : pad(minutes) + ':' + pad(seconds);
+    }
+
+    /**
+     * 对话下方状态栏条目：运行时长 + 强制终止。
+     * 运行态与起点由 Host 的 /api/turn-clock 给（刷新页面也不跳表），客户端只负责显示与点击。
+     */
+    function ForceStopDock(props) {
+      const sessionId = props && typeof props.sessionId === 'string' ? props.sessionId : '';
+      const setting = useForceStopSetting();
+      const [clock, setClock] = useState({ running: false, startedAt: 0 });
+      const [now, setNow] = useState(() => Date.now());
+      const [phase, setPhase] = useState('idle');
+      const [hover, setHover] = useState(false);
+      const [message, setMessage] = useState('');
+      const actionTimer = React.useRef(null);
+
+      useEffect(() => {
+        if (!sessionId || !setting.enabled) return undefined;
+        let alive = true;
+        const poll = async () => {
+          try {
+            const response = await fetch(API + '/turn-clock?sessionId=' + encodeURIComponent(sessionId), { cache: 'no-store' });
+            const data = await response.json();
+            if (!alive || !data || !data.ok) return;
+            const next = { running: data.running === true, startedAt: Number(data.startedAt) || 0 };
+            setClock(current => (current.running === next.running && current.startedAt === next.startedAt ? current : next));
+            if (next.running) setNow(Date.now());
+          } catch { /* 单次失败忽略，下轮再试 */ }
+        };
+        void poll();
+        const timer = setInterval(poll, 3000);
+        return () => { alive = false; clearInterval(timer); };
+      }, [sessionId, setting.enabled]);
+
+      useEffect(() => {
+        if (!clock.running) return undefined;
+        const timer = setInterval(() => setNow(Date.now()), 500);
+        return () => clearInterval(timer);
+      }, [clock.running]);
+
+      useEffect(() => () => { if (actionTimer.current) clearTimeout(actionTimer.current); }, []);
+
+      function clearActionTimer() {
+        if (actionTimer.current) { clearTimeout(actionTimer.current); actionTimer.current = null; }
+      }
+
+      async function stop() {
+        clearActionTimer();
+        setPhase('stopping');
+        setMessage('');
+        try {
+          const response = await fetch(API + '/force-stop', {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId }),
+          });
+          const data = await response.json();
+          if (!data || !data.ok) throw new Error((data && data.error) || ('HTTP ' + response.status));
+          const problems = (Array.isArray(data.steps) ? data.steps : []).filter(step => step && step.ok !== true && step.detail);
+          setPhase('done');
+          setClock(current => ({ ...current, running: false }));
+          setMessage(problems.length
+            ? '部分未完成：' + problems.map(step => step.name + ' ' + step.detail).join('；')
+            : '已发出强制终止');
+          actionTimer.current = setTimeout(() => { setPhase('idle'); setMessage(''); }, 4000);
+        } catch (error) {
+          setPhase('idle');
+          setMessage('强制终止失败：' + String(error && error.message ? error.message : error));
+        }
+      }
+
+      function onPress() {
+        if (phase === 'stopping' || phase === 'done') return;
+        if (phase === 'confirm') { void stop(); return; }
+        setPhase('confirm');
+        setMessage('');
+        clearActionTimer();
+        actionTimer.current = setTimeout(() => setPhase('idle'), 3000);
+      }
+
+      if (!setting.enabled) return null;
+      if (!clock.running && phase !== 'stopping' && phase !== 'done') return null;
+
+      const label = phase === 'confirm' ? '确认终止？' : phase === 'stopping' ? '终止中…' : phase === 'done' ? '已终止' : '强制终止';
+      const duration = clock.running && clock.startedAt ? formatRunDuration(clock.startedAt, now) : '';
+
+      return el('span', {
+        style: {
+          display: 'inline-flex', alignItems: 'center', gap: 8,
+          fontSize: 'calc(var(--dsh-content-font-size-secondary, 13px) - 1px)',
+          lineHeight: 'calc(20px + var(--dsh-content-font-delta-secondary, 0px))',
+          color: 'var(--dsw-alias-label-tertiary)',
+          whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums',
+        },
+      },
+        el('span', {
+          style: {
+            display: 'inline-flex', alignItems: 'center', gap: 4,
+            color: 'var(--dsw-alias-state-success-primary, #1e8449)',
+          },
+        },
+          el('span', { 'aria-hidden': 'true', style: { fontSize: 11, lineHeight: '14px' } }, '⏱'),
+          el('span', null, duration ? '运行 ' + duration : '运行中')),
+        el('button', {
+          type: 'button',
+          title: phase === 'confirm' ? '再点一次确认强制终止（会丢弃本轮未完成的输出）' : '强制终止：中止本轮，并清理该会话的后台任务、终端、子代理',
+          'aria-label': '强制终止当前任务',
+          disabled: phase === 'stopping' || phase === 'done',
+          onClick: onPress,
+          onMouseEnter: () => setHover(true),
+          onMouseLeave: () => setHover(false),
+          style: {
+            display: 'inline-flex', alignItems: 'center',
+            border: '1px solid var(--dsw-alias-state-error-primary, #c0392b)',
+            background: phase === 'confirm' ? 'rgba(192,57,43,0.18)'
+              : hover ? 'rgba(192,57,43,0.10)' : 'transparent',
+            color: 'var(--dsw-alias-state-error-primary, #c0392b)',
+            opacity: phase === 'stopping' || phase === 'done' ? 0.6 : 1,
+            borderRadius: 'var(--dsw-radius-sm, 6px)',
+            padding: '1px 8px', fontSize: 'inherit', lineHeight: 'inherit',
+            cursor: phase === 'stopping' || phase === 'done' ? 'default' : 'pointer',
+            fontFamily: 'inherit', whiteSpace: 'nowrap',
+          },
+        }, label),
+        message
+          ? el('span', {
+            title: message,
+            style: { opacity: 0.7, maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis' },
+          }, message)
+          : null);
+    }
+
     function ProxyDockPill() {
       const store = useProxyStatus();
       const [hover, setHover] = useState(false);
@@ -1329,6 +1593,7 @@ window.__ModuleLoader__.load({
 
     function apply(ctx) {
       void loadBalanceSettings();
+      void loadForceStopSetting();
       ctx.effect(() => installNativeOpening(ctx), 'dsh-lqconfig: native opening');
       ctx.slots.inject('shell.overlay', () => ctx.slots.register({
         name: 'shell.overlay', id: 'dsh-lqconfig.native-open-notice', order: 90,
@@ -1341,6 +1606,9 @@ window.__ModuleLoader__.load({
         name: 'sidebar.footer.action', id: 'dsh-lqconfig.proxy-badge', order: 90,
       }, ProxyStatusBadge));
       // 统计行里的「🟢 代理中」胶囊已按用户要求移除；ProxyDockPill 函数保留未用。
+      ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+        name: 'conversation.composer.dock', id: 'dsh-lqconfig.force-stop', order: -1,
+      }, ForceStopDock));
       // 需要恢复时解除下面三行注释：
       // ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
       //   name: 'conversation.composer.dock', id: 'dsh-lqconfig.proxy-pill', order: 2,
