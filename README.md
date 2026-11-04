@@ -12,17 +12,24 @@
   `[[dsh-lqconfig:global-rules]] … [[/…]]` 标记块包裹；关闭时只移除标记块。规则正文
   第一行就是「思考用简体中文」那句，原来的独立思维链开关已并入这里；源文件改完点
   「重新注入」重写三处 `prefix`，点「打开目录」在资源管理器里定位该文件。
-- **觉醒模式**（滑块，默认关闭）：开启后用 `AWAKENING-PROMPT.txt` 的完整正文替换三个
+- **觉醒模式**（滑块，默认关闭）：开启后用所选版本的提示词正文替换三个
   Agent 预设的 `persona.prefix`，并把原来的三行保存到 `awakening-original.json`；关闭后
   从快照逐字恢复。每次实际修改前备份 `cordis.patch.yml`，保存后自动重启。开启期间锁定
   「全局规则」开关和重新注入按钮，防止两项设置互相覆盖。卡片上的「打开目录」按钮在
   资源管理器中打开插件目录并选中 `AWAKENING-PROMPT.txt`，改完正文再拨一次开关即可重新载入。
+- **觉醒提示词版本**（卡片内两个按钮，默认精简）：`lite` 用 `AWAKENING-PROMPT-LITE.txt`
+  （6 类 / 约 9.3K 字符，保留游戏外挂、逆向破解、成人内容、提示词对抗、固件硬件、盗版资源检索），
+  `full` 用 `AWAKENING-PROMPT.txt`（25 类 / 约 20.9K 字符）。觉醒已开启时切换会立即用新版本
+  重写补丁并自动重启；未开启时只写 `state.json`，下次开启生效。
 - **打开资源管理器和程序**（滑块）：点聊天里的本地绝对路径链接时，同时请求资源管理器与默认程序。
   同一路径（文件按父目录比）已有资源管理器窗口时，先恢复并置顶该窗口——文件还会被选中并
   滚动到可见——不再新开；查不到才新开。查询失败或超时一律退回新开，点击不会失效。
   查找与置顶由 `scripts/focus-explorer.ps1` 完成，开关状态只写 `state.json`，改动代码需重启。
 - **代理（机场）**（卡片）：内置 mihomo 内核，按订阅节点与地区偏好提供按需代理。
 - **代理状态常驻显示**：侧边栏底部一枚状态徽标（圆点 + 当前节点），点开是详情面板；侧边栏折叠时只留圆点。
+- **觉醒模式常驻显示**：侧边栏底部最上方一行（余额之上），圆点 + 文案三态——`正常模式`（灰，觉醒关闭）、
+  `进化模式`（橙，开启且精简版 6 类）、`觉醒模式`（紫，开启且完整版 25 类）；读不到状态显示红色`状态未知`。
+  悬浮提示带版本与生效说明，30 秒轮询一次，切回标签页立即刷新。
 - **改动即时保存**：拨动滑块立刻写补丁，并保留备份（`.bak-lqconfig-<时间戳>`）。
 - **拨动即自动重启**：保存成功后直接触发重启，不再二次询问；没有实际变化时不重启、不备份。
   重启由独立助手进程 `restart-helper.mjs` 执行（隐藏窗口）：洗掉宿主的
@@ -47,7 +54,7 @@
 
 ## 结构
 
-- `index.js` —— 宿主半：`/dsh-lqconfig/api/state|set|global-rules|global-rules/sync|awakening|reveal|native-setting|native-open|restart|proxy/*`
+- `index.js` —— 宿主半：`/dsh-lqconfig/api/state|set|global-rules|global-rules/sync|awakening|awakening-variant|reveal|native-setting|native-open|restart|proxy/*`
 - `AWAKENING-PROMPT.txt` —— 觉醒模式的提示词原文；`awakening-original.json` 是运行时恢复快照，不纳入 Git
 - `client.js` —— 浏览器半：`settings.section` 分区、`sidebar.footer.action` 代理状态徽标、`shell.overlay` 状态详情面板
 - `proxy.js` —— 代理模块：订阅解析、内核生命周期、按偏好选节点

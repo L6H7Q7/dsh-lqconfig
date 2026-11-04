@@ -42,9 +42,13 @@ const RULES_LIMIT = 16000;
 const RULES_RE = / ?\[\[dsh-lqconfig:global-rules\]\][\s\S]*?\[\[\/dsh-lqconfig:global-rules\]\]/g;
 
 const AWAKENING_FILE = fileURLToPath(new URL('./AWAKENING-PROMPT.txt', import.meta.url));
+const AWAKENING_LITE_FILE = fileURLToPath(new URL('./AWAKENING-PROMPT-LITE.txt', import.meta.url));
 const AWAKENING_SNAPSHOT = fileURLToPath(new URL('./awakening-original.json', import.meta.url));
 const AWAKENING_MARKER = '# dsh-lqconfig:awakening';
 const AWAKENING_PRESETS = ['standard', 'ptc', 'cordis'];
+/** full = 完整 25 类；lite = 精简 6 类（游戏外挂/逆向破解/成人/提示词对抗/固件硬件/资源检索） */
+const AWAKENING_VARIANTS = ['full', 'lite'];
+const AWAKENING_VARIANT_DEFAULT = 'lite';
 
 function dshHome() {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
@@ -203,6 +207,20 @@ export async function readBalanceInterval() {
 export async function readForceStopEnabled() {
   const value = await readStateFile();
   return typeof value.forceStop === 'boolean' ? value.forceStop : true;
+}
+
+// 觉醒提示词版本：full=完整 25 类，lite=精简 6 类；缺键或非法值回落默认（精简）
+export async function readAwakeningVariant() {
+  const value = await readStateFile();
+  return AWAKENING_VARIANTS.includes(value.awakeningVariant) ? value.awakeningVariant : AWAKENING_VARIANT_DEFAULT;
+}
+
+export async function writeAwakeningVariant(variant) {
+  if (!AWAKENING_VARIANTS.includes(variant)) throw new Error('awakeningVariant 只能是 full 或 lite');
+  const current = await readStateFile();
+  current.awakeningVariant = variant;
+  await fs.writeFile(nativeStatePath, JSON.stringify(current, null, 2) + '\n', 'utf8');
+  return { awakeningVariant: variant };
 }
 
 export async function writeForceStopEnabled(enabled) {
@@ -776,6 +794,16 @@ export async function forceStopSession(sessionId) {
   return { steps };
 }
 
+/** 按字符数统计提示词正文长度（去 BOM、归一换行），与真正注入 prefix 的长度一致 */
+async function promptChars(file) {
+  try {
+    const raw = await fs.readFile(file, 'utf8');
+    return raw.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').trimEnd().length;
+  } catch {
+    return null;
+  }
+}
+
 export async function readState() {
   const file = patchPath();
   const exists = existsSync(file);
@@ -784,7 +812,11 @@ export async function readState() {
     enabled: !text.includes(BLOCK_START),
     globalRules: text.includes(RULES_START),
     awakening: text.includes(AWAKENING_MARKER),
+    awakeningVariant: await readAwakeningVariant(),
     awakeningPath: AWAKENING_FILE,
+    awakeningLitePath: AWAKENING_LITE_FILE,
+    awakeningChars: await promptChars(AWAKENING_FILE),
+    awakeningLiteChars: await promptChars(AWAKENING_LITE_FILE),
     rulesPath: RULES_FILE,
     ...(await readNativeSettings()),
     balanceBadge: await readBalanceBadge(),
@@ -921,6 +953,26 @@ function replaceAwakeningRanges(text, ranges, replacement) {
   return next;
 }
 
+/** 读指定版本的提示词正文；文件缺失或为空时明确报错。 */
+async function awakeningSource(variant) {
+  const file = variant === 'lite' ? AWAKENING_LITE_FILE : AWAKENING_FILE;
+  let raw;
+  try {
+    raw = await fs.readFile(file, 'utf8');
+  } catch (error) {
+    throw new Error('觉醒模式提示词文件读取失败：' + file + '（' + String(error && error.message ? error.message : error) + '）');
+  }
+  const source = raw.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').trimEnd();
+  if (!source.trim()) throw new Error('觉醒模式提示词文件为空：' + file);
+  return source;
+}
+
+/** 生成带 marker 的 prefix 块；正文压成单行（与全局规则同样的做法）。 */
+function awakeningBlock(source, newline) {
+  return '          prefix: |- ' + AWAKENING_MARKER + newline
+    + source.split('\n').map(line => '            ' + line).join(newline) + newline;
+}
+
 export async function writeAwakening(enabled) {
   if (typeof enabled !== 'boolean') throw new Error('enabled 必须是布尔值');
   const file = patchPath();
@@ -931,12 +983,11 @@ export async function writeAwakening(enabled) {
 
   let next;
   if (enabled) {
-    const source = (await fs.readFile(AWAKENING_FILE, 'utf8')).replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n').trimEnd();
-    if (!source.trim()) throw new Error('觉醒模式提示词文件为空');
+    const variant = await readAwakeningVariant();
+    const source = await awakeningSource(variant);
     const ranges = awakeningRanges(text, false);
     const newline = text.includes('\r\n') ? '\r\n' : '\n';
-    const block = '          prefix: |- ' + AWAKENING_MARKER + newline
-      + source.split('\n').map(line => '            ' + line).join(newline) + newline;
+    const block = awakeningBlock(source, newline);
     next = replaceAwakeningRanges(text, ranges, () => block);
     const snapshot = { version: 1, prefixes: Object.fromEntries(ranges.map(range => [range.preset, range.original])) };
     const bak = file + '.bak-lqconfig-' + stamp();
@@ -944,7 +995,7 @@ export async function writeAwakening(enabled) {
     await pruneBackups(file);
     await fs.writeFile(AWAKENING_SNAPSHOT, JSON.stringify(snapshot, null, 2) + '\n', 'utf8');
     await fs.writeFile(file, next, 'utf8');
-    return { changed: true, backup: bak };
+    return { changed: true, backup: bak, awakeningVariant: variant };
   }
 
   const snapshot = JSON.parse(await fs.readFile(AWAKENING_SNAPSHOT, 'utf8'));
@@ -958,6 +1009,36 @@ export async function writeAwakening(enabled) {
   await pruneBackups(file);
   await fs.writeFile(file, next, 'utf8');
   return { changed: true, backup: bak };
+}
+
+/**
+ * 切换提示词版本（full / lite）。
+ * 觉醒正开着时立即用新版本重写补丁（changed=true，需要重启才生效）；
+ * 觉醒关着时只记进 state.json，下次开启时按新版本注入。
+ */
+export async function switchAwakeningVariant(variant) {
+  if (!AWAKENING_VARIANTS.includes(variant)) throw new Error('variant 只能是 full 或 lite');
+  const previous = await readAwakeningVariant();
+  await writeAwakeningVariant(variant);
+  if (previous === variant) return { changed: false, applied: false, awakeningVariant: variant };
+
+  const file = patchPath();
+  if (!existsSync(file)) throw new Error('找不到 profile patch：' + file);
+  const text = await fs.readFile(file, 'utf8');
+  if (!text.includes(AWAKENING_MARKER)) return { changed: false, applied: false, awakeningVariant: variant };
+
+  const source = await awakeningSource(variant);
+  const newline = text.includes('\r\n') ? '\r\n' : '\n';
+  const block = awakeningBlock(source, newline);
+  const ranges = awakeningRanges(text, true);
+  const next = replaceAwakeningRanges(text, ranges, () => block);
+  if (next === text) return { changed: false, applied: true, awakeningVariant: variant };
+
+  const bak = file + '.bak-lqconfig-' + stamp();
+  await fs.copyFile(file, bak);
+  await pruneBackups(file);
+  await fs.writeFile(file, next, 'utf8');
+  return { changed: true, applied: true, backup: bak, awakeningVariant: variant };
 }
 
 /**
@@ -1115,6 +1196,15 @@ export function apply(ctx) {
               }
               const result = await writeAwakening(body.enabled);
               return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
+            }
+            if (req.method === 'POST' && route === '/api/awakening-variant') {
+              const body = await readBody(req);
+              try {
+                const result = await switchAwakeningVariant(body.variant);
+                return sendJson(res, 200, { ok: true, ...result, ...(await readState()) });
+              } catch (error) {
+                return sendJson(res, 400, { ok: false, error: String(error && error.message ? error.message : error) });
+              }
             }
             if (req.method === 'POST' && route === '/api/reveal') {
               const body = await readBody(req);

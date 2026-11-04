@@ -21,6 +21,12 @@ window.__ModuleLoader__.load({
 
     const API = '/dsh-lqconfig/api';
 
+    /** 提示词正文字符数的展示后缀：读不到就不显示（不做假数据） */
+    function charsSuffix(n) {
+      const v = Number(n);
+      return Number.isFinite(v) && v > 0 ? ' / ' + (v / 1000).toFixed(1) + 'K' : '';
+    }
+
     /* ---------------- 代理状态：侧边栏徽标与设置卡片共用 ---------------- */
     let proxySnapshot = {
       state: null, error: '', at: 0,
@@ -90,6 +96,58 @@ window.__ModuleLoader__.load({
         () => balanceSnapshot,
       );
     }
+    /* ---------------- 觉醒模式徽标：左下角最上方，正常 / 进化 / 觉醒 三态 ---------------- */
+    let awakeningSnapshot = { loaded: false, awakening: false, variant: 'lite', error: '' };
+    const awakeningSubscribers = new Set();
+    function publishAwakening(patch) {
+      awakeningSnapshot = { ...awakeningSnapshot, ...patch };
+      for (const listener of [...awakeningSubscribers]) listener();
+    }
+    function useAwakeningStatus() {
+      return React.useSyncExternalStore(
+        React.useCallback((listener) => { awakeningSubscribers.add(listener); return () => awakeningSubscribers.delete(listener); }, []),
+        () => awakeningSnapshot,
+      );
+    }
+    async function refreshAwakeningStatus() {
+      try {
+        const response = await fetch(API + '/state', { cache: 'no-store' });
+        const data = await response.json();
+        if (!data || !data.ok) throw new Error((data && data.error) || ('HTTP ' + response.status));
+        publishAwakening({
+          loaded: true,
+          awakening: data.awakening === true,
+          variant: data.awakeningVariant === 'full' ? 'full' : 'lite',
+          error: '',
+        });
+      } catch (error) {
+        publishAwakening({ loaded: true, error: String(error && error.message ? error.message : error) });
+      }
+    }
+    let awakeningPollTimer = null;
+    let awakeningPollUsers = 0;
+    function onAwakeningVisibility() {
+      if (typeof document !== 'undefined' && !document.hidden) void refreshAwakeningStatus();
+    }
+    function acquireAwakeningPolling() {
+      awakeningPollUsers += 1;
+      if (awakeningPollTimer === null) {
+        void refreshAwakeningStatus();
+        awakeningPollTimer = setInterval(() => {
+          if (typeof document !== 'undefined' && document.hidden) return;
+          void refreshAwakeningStatus();
+        }, 30000);
+        if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onAwakeningVisibility);
+      }
+      return () => {
+        awakeningPollUsers -= 1;
+        if (awakeningPollUsers > 0 || awakeningPollTimer === null) return;
+        clearInterval(awakeningPollTimer);
+        awakeningPollTimer = null;
+        if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onAwakeningVisibility);
+      };
+    }
+
     let balanceRequestId = 0;
     /** 失败后 15 秒内重试一次，避免首次失败要干等 5 分钟轮询周期 */
     let balanceRetryTimer = null;
@@ -937,6 +995,10 @@ window.__ModuleLoader__.load({
       const [awakeningMessage, setAwakeningMessage] = useState('');
       const [awakeningTone, setAwakeningTone] = useState('note');
       const [awakeningPath, setAwakeningPath] = useState('');
+      const [awakeningVariant, setAwakeningVariant] = useState('lite');
+      const [awakeningChars, setAwakeningChars] = useState(null);
+      const [awakeningLiteChars, setAwakeningLiteChars] = useState(null);
+      const [variantSaving, setVariantSaving] = useState(false);
       const [revealing, setRevealing] = useState('');
 
 
@@ -951,6 +1013,9 @@ window.__ModuleLoader__.load({
           setRules(Boolean(data.globalRules));
           setAwakening(Boolean(data.awakening));
           setAwakeningPath(data.awakeningPath || '');
+          setAwakeningVariant(data.awakeningVariant === 'full' ? 'full' : 'lite');
+          setAwakeningChars(Number.isFinite(data.awakeningChars) ? data.awakeningChars : null);
+          setAwakeningLiteChars(Number.isFinite(data.awakeningLiteChars) ? data.awakeningLiteChars : null);
           setPatchPath(data.patchPath || '');
           try {
             const infoRes = await fetch(API + '/global-rules', { cache: 'no-store' });
@@ -1054,6 +1119,37 @@ window.__ModuleLoader__.load({
       }
 
       /**
+       * 切换觉醒提示词版本：lite（精简 6 类）/ full（完整 25 类）。
+       * 觉醒开着时后端会立即用新版本重写补丁，需要重启才生效；关着时只记配置。
+       */
+      async function persistAwakeningVariant(next) {
+        if (next === awakeningVariant || variantSaving) return;
+        const label = next === 'lite' ? '精简版' : '完整版';
+        setVariantSaving(true);
+        setAwakeningMessage('');
+        try {
+          const res = await fetch(API + '/awakening-variant', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ variant: next }),
+          });
+          const data = await res.json();
+          if (!data.ok) throw new Error(data.error || '切换失败');
+          setAwakeningVariant(data.awakeningVariant === 'full' ? 'full' : 'lite');
+          if (data.changed) {
+            await restartAt('awakening');
+            return;
+          }
+          setAwakeningMessage(data.applied === false ? '已切换为' + label + '；觉醒未开启，下次开启时生效。' : '已是' + label + '，未做改动。');
+          setAwakeningTone('ok');
+        } catch (error) {
+          setAwakeningMessage('切换失败：' + String(error && error.message ? error.message : error));
+          setAwakeningTone('warn');
+        }
+        setVariantSaving(false);
+      }
+
+      /**
        * 提示词更新入口：在资源管理器里打开源文件所在目录并选中它。
        * which: 'rules' → GLOBAL-RULES.md；'awakening' → AWAKENING-PROMPT.txt。
        * 只定位不改内容，用户改完文本再拨开关或点「重新注入」。
@@ -1154,9 +1250,24 @@ window.__ModuleLoader__.load({
             el('div', { style: S.title }, '觉醒模式'),
             el(Switch, { checked: awakening, disabled: awakeningSaving || rulesSaving, label: '觉醒模式',
               onChange: event => { const next = event.target.checked; setAwakening(next); void persistAwakening(next); } })),
-          el('div', { style: S.desc }, '开启后，用 AWAKENING-PROMPT.txt 的完整内容替换三个 Agent 预设的 persona.prefix；关闭后从原文快照逐字恢复。保存后自动重启。开启期间暂时锁定「全局规则」，避免互相覆盖。改完提示词再拨一次开关（或重开）即可重新载入。'),
+          el('div', { style: S.desc }, '开启后，用所选版本的提示词正文替换三个 Agent 预设的 persona.prefix；关闭后从原文快照逐字恢复。保存后自动重启。开启期间暂时锁定「全局规则」，避免互相覆盖。改完提示词再拨一次开关（或重开）即可重新载入。'),
           el('div', { style: S.status }, '当前：' + (awakening ? '已开启' : '未开启') + (awakeningSaving ? ' · 处理中…' : '')),
           awakeningMessage ? el('div', { style: awakeningTone === 'warn' ? S.warn : awakeningTone === 'ok' ? S.ok : S.note }, awakeningMessage) : null,
+          el('div', { style: { marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
+            el('span', { style: { fontSize: 12, opacity: 0.65 } }, '提示词版本：'),
+            el('button', {
+              style: awakeningVariant === 'lite' ? { ...S.btn, ...S.primary } : S.btn,
+              disabled: variantSaving || awakeningSaving,
+              title: Number.isFinite(awakeningLiteChars) ? '精简版正文 ' + awakeningLiteChars + ' 字符' : '精简版正文大小未知',
+              onClick: () => { void persistAwakeningVariant('lite'); },
+            }, '精简 · 6 类' + charsSuffix(awakeningLiteChars)),
+            el('button', {
+              style: awakeningVariant === 'full' ? { ...S.btn, ...S.primary } : S.btn,
+              disabled: variantSaving || awakeningSaving,
+              title: Number.isFinite(awakeningChars) ? '完整版正文 ' + awakeningChars + ' 字符' : '完整版正文大小未知',
+              onClick: () => { void persistAwakeningVariant('full'); },
+            }, '完整 · 25 类' + charsSuffix(awakeningChars))),
+          el('div', { style: S.note }, '精简版保留：游戏外挂与反作弊绕过、逆向与破解、成人内容与片源检索、提示词对抗研究、固件与硬件、盗版资源检索，其余 19 类全部删除。觉醒已开启时切换版本会立即重写补丁并自动重启；未开启时只记配置，下次开启生效。'),
           el('div', { style: { marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' } },
             el('button', { style: S.btn, disabled: revealing === 'awakening', onClick: () => { void reveal('awakening'); } }, revealing === 'awakening' ? '打开中…' : '打开目录')),
           el('div', { style: S.mono }, '源：' + (awakeningPath || '（未知）'))),
@@ -1203,12 +1314,110 @@ window.__ModuleLoader__.load({
       const store = useProxyStatus();
       const state = store.state;
       const balance = useBalance();
+      const awake = useAwakeningStatus();
 
       useEffect(() => acquireProxyPolling(), []);
+      useEffect(() => acquireAwakeningPolling(), []);
+      const [modeMenu, setModeMenu] = useState(false);
+      const modeMenuRef = React.useRef(null);
+      const [modeSaving, setModeSaving] = useState(false);
+      const [balanceRefreshing, setBalanceRefreshing] = useState(false);
+
+      // 菜单打开时：点外部或按 Esc 关闭（捕获阶段监听，避免被内部 stopPropagation 挡住）
+      useEffect(() => {
+        if (!modeMenu) return undefined;
+        function onDocPointerDown(event) {
+          const node = modeMenuRef.current;
+          if (node && node.contains(event.target)) return;
+          setModeMenu(false);
+        }
+        function onDocKeyDown(event) {
+          if (event.key === 'Escape') setModeMenu(false);
+        }
+        document.addEventListener('pointerdown', onDocPointerDown, true);
+        document.addEventListener('keydown', onDocKeyDown, true);
+        return () => {
+          document.removeEventListener('pointerdown', onDocPointerDown, true);
+          document.removeEventListener('keydown', onDocKeyDown, true);
+        };
+      }, [modeMenu]);
+
+      /**
+       * 三模式切换（点击左下角觉醒行弹出的菜单）：
+       * normal = 关闭觉醒；lite = 开启 + 精简版；full = 开启 + 完整版。
+       * 先对齐版本再对齐开关，任一改动落地后统一重启一次。
+       */
+      async function applyAwakeningMode(mode) {
+        if (modeSaving) return;
+        setModeMenu(false);
+        const wantEnabled = mode !== 'normal';
+        const wantVariant = mode === 'full' ? 'full' : 'lite';
+        setModeSaving(true);
+        let needRestart = false;
+        try {
+          if (wantEnabled && wantVariant !== awake.variant) {
+            const res = await fetch(API + '/awakening-variant', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ variant: wantVariant }),
+            });
+            const data = await res.json();
+            if (!data.ok) throw new Error(data.error || '切换版本失败');
+            if (data.changed) needRestart = true;
+          }
+          if (wantEnabled !== awake.awakening) {
+            const res = await fetch(API + '/awakening', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ enabled: wantEnabled }),
+            });
+            const data = await res.json();
+            if (!data.ok) throw new Error(data.error || '切换开关失败');
+            if (data.changed) needRestart = true;
+          }
+          if (needRestart) {
+            await refreshAwakeningStatus();
+            await new Promise(resolve => setTimeout(resolve, 600));
+            try { await fetch(API + '/restart', { method: 'POST' }); } catch { /* 重启请求失败不阻塞 */ }
+            return;
+          }
+          await refreshAwakeningStatus();
+        } catch (error) {
+          publishAwakening({ error: String(error && error.message ? error.message : error) });
+        }
+        setModeSaving(false);
+      }
+
+      async function onBalanceRefresh(event) {
+        event.stopPropagation();
+        if (balanceRefreshing) return;
+        setBalanceRefreshing(true);
+        try {
+          await refreshBalance(true);
+          await new Promise(resolve => setTimeout(resolve, 400));
+        } finally {
+          setBalanceRefreshing(false);
+        }
+      }
       useEffect(() => {
         if (!balance.enabled) return undefined;
         return acquireBalancePolling();
       }, [balance.enabled]);
+
+      // 三态：觉醒关闭=正常模式；开启+精简=进化模式；开启+完整=觉醒模式
+      const aMode = awake.error ? '状态未知'
+        : !awake.loaded ? '读取中…'
+          : !awake.awakening ? '正常模式'
+            : awake.variant === 'full' ? '觉醒模式' : '进化模式';
+      const aColor = awake.error ? '#c0392b'
+        : !awake.loaded ? 'rgba(128,128,128,0.6)'
+          : !awake.awakening ? 'rgba(128,128,128,0.6)'
+            : awake.variant === 'full' ? '#8e44ad' : '#c28b30';
+      const aHalo = awake.awakening && !awake.error
+        ? (awake.variant === 'full' ? '0 0 0 3px rgba(142,68,173,0.16)' : '0 0 0 3px rgba(194,139,48,0.16)')
+        : 'none';
+      const aDetail = '觉醒模式：' + aMode
+        + (awake.error ? '（' + awake.error + '）'
+          : awake.awakening ? (awake.variant === 'full' ? '（提示词完整版 25 类）' : '（提示词精简版 6 类）')
+            : '（未注入提示词，用原生人格）');
 
       const running = Boolean(state && state.running);
       const enabled = Boolean(state && state.enabled);
@@ -1238,13 +1447,75 @@ window.__ModuleLoader__.load({
           flex: '1 1 auto', minWidth: 0, width: wide ? '100%' : 'auto',
         },
       },
-        balance.enabled ? el('div', {
-          title: bDetail,
-          'aria-label': bDetail,
+        el('div', { ref: modeMenuRef, style: { position: 'relative' } },
+          el('button', {
+            type: 'button',
+            title: aDetail + '，点击切换模式',
+            'aria-haspopup': 'menu',
+            'aria-expanded': modeMenu ? 'true' : 'false',
+            onClick: (event) => { event.stopPropagation(); setModeMenu(!modeMenu); },
+            style: {
+              display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, width: '100%',
+              padding: wide ? '6px 10px' : '6px', margin: 0,
+              background: modeMenu ? 'rgba(128,128,128,0.14)' : 'transparent',
+              border: 'none', borderRadius: 8, cursor: 'pointer', color: 'inherit',
+              fontSize: 12, textAlign: 'left', justifyContent: wide ? 'flex-start' : 'center',
+            },
+          },
+            el('span', {
+              'aria-hidden': 'true',
+              style: {
+                width: 8, height: 8, flex: '0 0 auto', borderRadius: 4, background: aColor,
+                boxShadow: aHalo,
+                transition: 'background .2s',
+              },
+            }),
+            wide ? el('span', {
+              style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.85 },
+            }, modeSaving ? '切换中…' : aMode) : null),
+          modeMenu ? el('div', {
+            role: 'menu',
+            style: {
+              position: 'absolute', bottom: '100%', left: 0, marginBottom: 6, minWidth: 168,
+              padding: 4, borderRadius: 10, zIndex: 9999,
+              border: '1px solid rgba(128,128,128,0.32)',
+              background: 'rgba(150,150,150,0.22)',
+              backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)',
+              boxShadow: '0 8px 24px rgba(0,0,0,0.22)',
+            },
+          },
+            [['normal', '正常模式', '关闭提示词注入'], ['lite', '进化模式', '开启 · 精简 6 类'], ['full', '觉醒模式', '开启 · 完整 25 类']].map(([mode, name, hint]) => {
+              const current = mode === 'normal' ? !awake.awakening : (awake.awakening && awake.variant === mode);
+              return el('button', {
+                key: mode,
+                type: 'button',
+                role: 'menuitemradio',
+                'aria-checked': current ? 'true' : 'false',
+                disabled: modeSaving,
+                onClick: (event) => { event.stopPropagation(); void applyAwakeningMode(mode); },
+                style: {
+                  display: 'flex', alignItems: 'center', gap: 8, width: '100%',
+                  padding: '6px 8px', margin: 0, background: current ? 'rgba(128,128,128,0.20)' : 'transparent',
+                  border: 'none', borderRadius: 7, cursor: modeSaving ? 'default' : 'pointer',
+                  color: 'inherit', fontSize: 12, textAlign: 'left',
+                },
+              },
+                el('span', { style: { width: 10, flex: '0 0 auto', opacity: current ? 0.9 : 0 } }, current ? '✓' : ''),
+                el('span', { style: { display: 'flex', flexDirection: 'column', minWidth: 0 } },
+                  el('span', { style: { whiteSpace: 'nowrap' } }, name),
+                  el('span', { style: { fontSize: 10, opacity: 0.6, whiteSpace: 'nowrap' } }, hint)));
+            })) : null),
+        balance.enabled ? el('button', {
+          type: 'button',
+          title: bDetail + '，点击立即刷新',
+          onClick: onBalanceRefresh,
+          disabled: balanceRefreshing,
           style: {
-            display: 'flex', alignItems: 'center', gap: 8, minWidth: 0,
-            padding: wide ? '6px 10px' : '6px', fontSize: 12,
-            textAlign: 'left', justifyContent: wide ? 'flex-start' : 'center',
+            display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, width: '100%',
+            padding: wide ? '6px 10px' : '6px', margin: 0,
+            background: 'transparent', border: 'none', borderRadius: 8,
+            cursor: balanceRefreshing ? 'default' : 'pointer', color: 'inherit',
+            fontSize: 12, textAlign: 'left', justifyContent: wide ? 'flex-start' : 'center',
           },
         },
           el('span', {
@@ -1257,7 +1528,7 @@ window.__ModuleLoader__.load({
           }),
           wide ? el('span', {
             style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.85 },
-          }, bLabel) : null) : null,
+          }, balanceRefreshing ? '刷新中…' : bLabel) : null) : null,
         el('button', {
           type: 'button',
           title: detail + '，点击查看详情',
