@@ -54,6 +54,41 @@ function patchPath() {
   return path.join(dshHome(), 'profiles', 'desktop', 'cordis.patch.yml');
 }
 
+/**
+ * 当前代理地址的状态文件 —— 本机脚本/插件读取它拿 lqconfig 代理地址，
+ * 避免各处把端口写死。只写一个位置，内容随代理启停与端口变化刷新：
+ *   { proxy: 'http://127.0.0.1:<port>' | '', port, running, enabled, updatedAt }
+ */
+const PROXY_ENDPOINT_FILE = path.join(dshHome(), 'lqconfig-proxy.json');
+
+export async function syncProxyEndpoint() {
+  let record;
+  try {
+    const status = await proxy.status();
+    record = {
+      proxy: status && status.running ? String(status.proxy || '') : '',
+      port: status ? status.port : null,
+      running: Boolean(status && status.running),
+      enabled: Boolean(status && status.enabled),
+      updatedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    record = {
+      proxy: '',
+      port: null,
+      running: false,
+      enabled: false,
+      error: String(error && error.message ? error.message : error),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  try {
+    await fs.mkdir(path.dirname(PROXY_ENDPOINT_FILE), { recursive: true });
+    await fs.writeFile(PROXY_ENDPOINT_FILE, JSON.stringify(record) + '\n', 'utf8');
+  } catch { /* 只是给本机脚本用的辅助文件，写失败不影响代理功能 */ }
+  return record;
+}
+
 function exePath() {
   return process.env.DSH_DESKTOP_EXE || 'D:\\AI\\Agent\\DeepSeek Harness\\DeepSeek Harness.exe';
 }
@@ -74,6 +109,27 @@ function stamp() {
   const p = (n) => String(n).padStart(2, '0');
   const ms = String(d.getMilliseconds()).padStart(3, '0');
   return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + ms;
+}
+
+/** 备份保留份数：只留最近 2 份，更旧的自动删除（只认 .bak-lqconfig- 前缀，不动手工备份） */
+const BACKUP_KEEP = 2;
+
+/**
+ * 清理同一个源文件的旧备份。备份名是「文件名.bak-lqconfig-yyyyMMdd-HHmmssSSS」，
+ * 时间戳字典序即时间序，留最近 BACKUP_KEEP 份，其余删除。失败不影响主流程。
+ */
+async function pruneBackups(file) {
+  try {
+    const dir = path.dirname(file);
+    const prefix = path.basename(file) + '.bak-lqconfig-';
+    const names = (await fs.readdir(dir))
+      .filter((name) => name.startsWith(prefix))
+      .sort();
+    const stale = names.slice(0, Math.max(0, names.length - BACKUP_KEEP));
+    for (const name of stale) {
+      await fs.rm(path.join(dir, name), { force: true });
+    }
+  } catch { /* 清理失败不影响写入/开关本身 */ }
 }
 
 // Native opening belongs to this plugin; it does not alter the profile patch.
@@ -765,6 +821,7 @@ export async function writeEnabled(enabled) {
 
   const bak = file + '.bak-lqconfig-' + stamp();
   await fs.copyFile(file, bak);
+  await pruneBackups(file);
   await fs.writeFile(file, next, 'utf8');
   return { changed: true, backup: bak };
 }
@@ -832,6 +889,7 @@ export async function writeGlobalRules(enabled) {
 
   const bak = file + '.bak-lqconfig-' + stamp();
   await fs.copyFile(file, bak);
+  await pruneBackups(file);
   await fs.writeFile(file, next, 'utf8');
   return { changed: true, backup: bak, injectedPrefixes: enabled ? 3 : 0 };
 }
@@ -883,6 +941,7 @@ export async function writeAwakening(enabled) {
     const snapshot = { version: 1, prefixes: Object.fromEntries(ranges.map(range => [range.preset, range.original])) };
     const bak = file + '.bak-lqconfig-' + stamp();
     await fs.copyFile(file, bak);
+    await pruneBackups(file);
     await fs.writeFile(AWAKENING_SNAPSHOT, JSON.stringify(snapshot, null, 2) + '\n', 'utf8');
     await fs.writeFile(file, next, 'utf8');
     return { changed: true, backup: bak };
@@ -896,6 +955,7 @@ export async function writeAwakening(enabled) {
   next = replaceAwakeningRanges(text, ranges, range => snapshot.prefixes[range.preset]);
   const bak = file + '.bak-lqconfig-' + stamp();
   await fs.copyFile(file, bak);
+  await pruneBackups(file);
   await fs.writeFile(file, next, 'utf8');
   return { changed: true, backup: bak };
 }
@@ -973,11 +1033,14 @@ export function apply(ctx) {
   let warmupTimer = setTimeout(() => {
     warmupTimer = null;
     void proxy.readSettings()
-      .then((settings) => {
-        if (!settings.enabled || !settings.url) return undefined;
-        return proxy.ensure();
+      .then(async (settings) => {
+        if (!settings.enabled || !settings.url) { await syncProxyEndpoint(); return undefined; }
+        const started = await proxy.ensure();
+        await syncProxyEndpoint();
+        return started;
       })
       .catch((error) => {
+        void syncProxyEndpoint().catch(() => {});
         try { ctx.logger?.warn?.('[dsh-lqconfig] 代理预热失败：' + (error && error.message ? error.message : error)); } catch { /* 忽略 */ }
       });
   }, WARMUP_DELAY_MS);
@@ -1095,6 +1158,7 @@ export function apply(ctx) {
                   hasUrl: Boolean(settings.url),
                   host,
                   url: settings.url ? host + '（已保存）' : '',
+                  endpointFile: PROXY_ENDPOINT_FILE,
                 });
               }
               if (req.method === 'GET' && action === 'regions') {
@@ -1118,14 +1182,19 @@ export function apply(ctx) {
                 if (typeof body.refreshMinutes === 'number') patch.refreshMinutes = body.refreshMinutes;
                 const settings = await proxy.writeSettings(patch);
                 if (settings.enabled === false) await proxy.stop();
+                await syncProxyEndpoint();
                 return sendJson(res, 200, { ok: true, ...(await proxy.status()) });
               }
               if (req.method === 'POST' && action === 'ensure') {
                 const body = await readBody(req);
-                return sendJson(res, 200, { ok: true, ...(await proxy.ensure(body && body.force === true)) });
+                const ensured = await proxy.ensure(body && body.force === true);
+                await syncProxyEndpoint();
+                return sendJson(res, 200, { ok: true, ...ensured });
               }
               if (req.method === 'POST' && action === 'stop') {
-                return sendJson(res, 200, { ok: true, ...(await proxy.stop()) });
+                const stopped = await proxy.stop();
+                await syncProxyEndpoint();
+                return sendJson(res, 200, { ok: true, ...stopped });
               }
               return sendJson(res, 404, { ok: false, error: 'not found' });
             }
