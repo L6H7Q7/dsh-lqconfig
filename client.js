@@ -329,6 +329,13 @@ window.__ModuleLoader__.load({
       warn: { fontSize: 12, color: '#c0392b', marginTop: 10 },
       ok: { fontSize: 12, color: '#1e8449', marginTop: 10 },
       mono: { fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 12, opacity: 0.6, marginTop: 8, wordBreak: 'break-all' },
+      extRow: { marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-start' },
+      extLabel: { fontSize: 12, opacity: 0.65, minWidth: 84, lineHeight: '28px' },
+      chipBox: { flex: '1 1 260px', display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', minHeight: 28 },
+      chip: { display: 'inline-flex', alignItems: 'center', gap: 2, padding: '2px 2px 2px 9px', borderRadius: 7, border: '1px solid rgba(128,128,128,0.35)', background: 'rgba(128,128,128,0.08)', fontSize: 12, lineHeight: '18px' },
+      chipX: { border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', fontSize: 13, lineHeight: 1, padding: '2px 5px', opacity: 0.55, borderRadius: 5 },
+      chipAdd: { width: 28, height: 26, borderRadius: 7, border: '1px dashed rgba(128,128,128,0.55)', background: 'transparent', color: 'inherit', cursor: 'pointer', fontSize: 15, lineHeight: 1, opacity: 0.75, padding: 0 },
+      chipInput: { width: 76, height: 26, boxSizing: 'border-box', fontFamily: 'inherit', fontSize: 12, padding: '2px 8px', borderRadius: 7, border: '1px solid rgba(128,128,128,0.55)', background: 'transparent', color: 'inherit', outline: 'none' },
     };
 
     function Switch(props) {
@@ -348,8 +355,29 @@ window.__ModuleLoader__.load({
         el('span', { style: { position: 'absolute', top: 3, left: checked ? 23 : 3, width: 18, height: 18, borderRadius: 9, background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,.25)', transition: 'left .2s' } }));
     }
 
+    /*
+     * 扩展名名单：名单外一律「程序 + 文件夹」两路都做；名单命中即固定单路。
+     * folderOnlyExts  —— 只打开文件夹并选中，不调用默认程序（apk → 不启动模拟器）
+     * programOnlyExts —— 只调用默认程序，不弹资源管理器（exe/bat 等执行型）
+     * 互斥校验在 Host 侧；这里只做输入解析、默认值与展示。
+     */
+    const NATIVE_FOLDER_ONLY_DEFAULT = ['apk'];
+    const NATIVE_PROGRAM_ONLY_DEFAULT = ['exe', 'com', 'bat', 'cmd', 'vbs', 'vbe', 'ps1', 'msi', 'lnk', 'scr'];
+    const NATIVE_EXT_MAX = 32;
+    function parseExtInput(text) {
+      return String(text || '')
+        .split(/[\s,，、;；]+/u)
+        .map(item => item.trim().toLowerCase().replace(/^\.+/u, ''))
+        .filter(Boolean);
+    }
+
     // Plugin-lifetime state: closing the settings page does not turn this off.
-    let nativeSnapshot = { openNative: false, saving: false, message: '', error: '', compatibility: '', notice: null };
+    let nativeSnapshot = {
+      openNative: false,
+      folderOnlyExts: [...NATIVE_FOLDER_ONLY_DEFAULT],
+      programOnlyExts: [...NATIVE_PROGRAM_ONLY_DEFAULT],
+      saving: false, savingExts: false, message: '', error: '', compatibility: '', notice: null,
+    };
     const nativeSubscribers = new Set();
     let nativeDisposed = true;
     let nativeRevision = 0;
@@ -383,7 +411,12 @@ window.__ModuleLoader__.load({
       const revision = ++nativeRevision;
       try {
         const data = await nativeJson('/state');
-        if (revision === nativeRevision) publishNative({ openNative: data.openNative === true, error: '' });
+        if (revision === nativeRevision) publishNative({
+          openNative: data.openNative === true,
+          folderOnlyExts: Array.isArray(data.folderOnlyExts) ? data.folderOnlyExts : [...NATIVE_FOLDER_ONLY_DEFAULT],
+          programOnlyExts: Array.isArray(data.programOnlyExts) ? data.programOnlyExts : [...NATIVE_PROGRAM_ONLY_DEFAULT],
+          error: '',
+        });
       } catch (error) {
         if (revision === nativeRevision) publishNative({ openNative: false, error: '读取系统打开设置失败：' + error.message });
       }
@@ -394,10 +427,29 @@ window.__ModuleLoader__.load({
       publishNative({ saving: true, ...(enabled ? {} : { openNative: false }), message: '', error: '' });
       try {
         const data = await nativeJson('/native-setting', { enabled });
-        if (revision === nativeRevision) publishNative({ openNative: data.openNative === true, saving: false, message: '已保存，即时生效，无需重启。' });
+        if (revision === nativeRevision) publishNative({
+          openNative: data.openNative === true,
+          folderOnlyExts: Array.isArray(data.folderOnlyExts) ? data.folderOnlyExts : nativeSnapshot.folderOnlyExts,
+          programOnlyExts: Array.isArray(data.programOnlyExts) ? data.programOnlyExts : nativeSnapshot.programOnlyExts,
+          saving: false, message: '已保存，即时生效，无需重启。',
+        });
       } catch (error) {
         // Fail closed; an unsaved toggle must never silently activate opening.
         if (revision === nativeRevision) publishNative({ openNative: false, saving: false, error: '保存失败：' + error.message });
+      }
+    }
+    async function saveExtLists(folderOnlyExts, programOnlyExts) {
+      const revision = ++nativeRevision;
+      publishNative({ savingExts: true, message: '', error: '' });
+      try {
+        const data = await nativeJson('/native-setting', { folderOnlyExts, programOnlyExts });
+        if (revision === nativeRevision) publishNative({
+          folderOnlyExts: Array.isArray(data.folderOnlyExts) ? data.folderOnlyExts : folderOnlyExts,
+          programOnlyExts: Array.isArray(data.programOnlyExts) ? data.programOnlyExts : programOnlyExts,
+          savingExts: false, message: '名单已保存，即时生效，无需重启。',
+        });
+      } catch (error) {
+        if (revision === nativeRevision) publishNative({ savingExts: false, error: '保存失败：' + error.message });
       }
     }
     function nativePathOf(value, options) {
@@ -426,8 +478,11 @@ window.__ModuleLoader__.load({
         const data = await nativeJson('/native-open', { path: target, ...(operations ? { operations } : {}) });
         if (!nativeDisposed && id === nativeNoticeSequence) {
           const explorer = data.explorer;
+          const program = data.program;
           const message = explorer?.reused === true
             ? '已切换到已打开的资源管理器窗口（未新建）' + (explorer.selected === true ? '，并选中目标文件。' : '。')
+            : program && !explorer ? '已请求系统默认程序打开（该扩展名只走这一路）；窗口是否出现尚未核实。'
+            : !program && explorer ? '已请求资源管理器定位（该扩展名只走这一路）；窗口是否出现尚未核实。'
             : '打开请求已提交；窗口是否出现尚未核实。';
           publishNative({ message, notice: null });
         }
@@ -437,7 +492,9 @@ window.__ModuleLoader__.load({
             { key: 'program', label: '系统程序', result: error.program },
             { key: 'explorer', label: '资源管理器', result: error.explorer },
           ].filter(item => item.result);
-          const retryOperations = results.length ? results.filter(item => !item.result.ok).map(item => item.key) : operations || ['program', 'explorer'];
+          const retryOperations = results.length
+            ? results.filter(item => !item.result.ok).map(item => item.key)
+            : (Array.isArray(operations) ? operations : []);
           publishNative({ notice: {
             id, path: target, busy: false,
             message: results.length ? '打开请求结果' : error.message,
@@ -1000,6 +1057,74 @@ window.__ModuleLoader__.load({
       const [awakeningLiteChars, setAwakeningLiteChars] = useState(null);
       const [variantSaving, setVariantSaving] = useState(false);
       const [revealing, setRevealing] = useState('');
+      // 名单编辑：'' = 没在输入；'folder' / 'program' = 哪个名单正在加一个格。
+      const [extEditing, setExtEditing] = useState('');
+      const [extDraft, setExtDraft] = useState({ folder: '', program: '' });
+      const extCancelRef = React.useRef(false);
+
+      function listOf(which) {
+        return which === 'folder' ? (native.folderOnlyExts || []) : (native.programOnlyExts || []);
+      }
+      function beginExtEdit(which) {
+        if (native.savingExts || extEditing === which) return;
+        // 切到另一个名单时，先把正在输入的那个提交掉，避免内容被吞。
+        if (extEditing) void commitExtEdit(extEditing);
+        extCancelRef.current = false;
+        setExtDraft(prev => ({ ...prev, [which]: '' }));
+        setExtEditing(which);
+      }
+      async function commitExtEdit(which) {
+        if (extCancelRef.current) { extCancelRef.current = false; return; }
+        const raw = extDraft[which];
+        setExtEditing('');
+        setExtDraft(prev => ({ ...prev, [which]: '' }));
+        const added = parseExtInput(raw);
+        if (!added.length) return;
+        const merged = Array.from(new Set([...listOf(which), ...added]));
+        if (which === 'folder') await saveExtLists(merged, native.programOnlyExts || []);
+        else await saveExtLists(native.folderOnlyExts || [], merged);
+      }
+      function removeExt(which, ext) {
+        if (native.savingExts) return;
+        const rest = listOf(which).filter(item => item !== ext);
+        if (which === 'folder') void saveExtLists(rest, native.programOnlyExts || []);
+        else void saveExtLists(native.folderOnlyExts || [], rest);
+      }
+      function renderExtRow(which, label) {
+        const list = listOf(which);
+        const editing = extEditing === which;
+        const draft = extDraft[which];
+        return el('div', { style: S.extRow },
+          el('span', { style: S.extLabel }, label),
+          el('div', { style: S.chipBox },
+            list.map(ext => el('span', { key: ext, style: S.chip },
+              el('span', null, ext),
+              el('button', {
+                type: 'button', style: S.chipX, title: '移除 .' + ext, disabled: native.savingExts,
+                onClick: () => removeExt(which, ext),
+              }, '×'))),
+            editing
+              ? el('input', {
+                type: 'text', autoFocus: true, value: draft, style: S.chipInput, placeholder: 'apk',
+                disabled: native.savingExts,
+                onChange: event => setExtDraft(prev => ({ ...prev, [which]: event.target.value })),
+                // 点空白处 / 回车即保存；Esc 取消这一格。
+                onBlur: () => { void commitExtEdit(which); },
+                onKeyDown: event => {
+                  if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur(); }
+                  else if (event.key === 'Escape') {
+                    event.preventDefault();
+                    extCancelRef.current = true;
+                    setExtDraft(prev => ({ ...prev, [which]: '' }));
+                    setExtEditing('');
+                  }
+                },
+              })
+              : el('button', {
+                type: 'button', style: S.chipAdd, title: '添加扩展名', disabled: native.savingExts,
+                onClick: () => beginExtEdit(which),
+              }, '＋')));
+      }
 
 
       useEffect(() => { void load(); }, []);
@@ -1276,8 +1401,20 @@ window.__ModuleLoader__.load({
             el('div', { style: S.title }, '打开资源管理器和程序'),
             el(Switch, { checked: native.openNative, disabled: native.saving, label: '打开资源管理器和程序',
               onChange: event => { void saveNativeSettings(event.target.checked); } })),
-          el('div', { style: S.desc }, '开启后，点击聊天里的本地绝对路径链接，会保留 Sidebar 原有预览，同时请求资源管理器和默认程序打开该路径。资源管理器会选中文件或打开目录；两路分别报告结果。同一路径（文件取父目录）已有资源管理器窗口时，直接置顶复用该窗口并在需要时选中文件，不再新开；查询不到才新开。行号链接、相对路径和网页链接保持原有行为。'),
-          el('div', { style: S.status }, '当前：' + (native.openNative ? '已开启' : '未开启') + (native.saving ? ' · 保存中…' : '') + ' · 保存即时生效'),
+          el('div', { style: S.desc }, '开启后，点击聊天里的本地绝对路径链接，会保留 Sidebar 原有预览，再按下面的名单请求系统打开该路径。行号链接、相对路径和网页链接保持原有行为。'),
+          el('div', { style: S.desc }, '名单外的文件默认「程序打开 + 文件夹定位」两路都做；点「＋」把扩展名加进名单，就固定只走那一路。同一个扩展名只能出现在一边。'),
+          renderExtRow('folder', '只开文件夹：'),
+          el('div', { style: S.note }, '例如 apk：资源管理器定位并选中该文件，绝不调用默认程序，模拟器不会被拉起。点 × 移除；「＋」输入后点空白处或回车即保存，Esc 取消。'),
+          renderExtRow('program', '只开程序：'),
+          el('div', { style: S.note }, '例如 exe：只启动程序，不再弹资源管理器定位。这一排清空后，这些文件会恢复两路都做（多点一个窗口）。每边最多 ' + NATIVE_EXT_MAX + ' 项。'),
+          (native.programOnlyExts || []).length === 0
+            ? el('div', { style: S.warn }, '「只开程序」名单是空的：exe 等会恢复两路都做，启动程序时会多弹一个资源管理器窗口。')
+            : null,
+          el('div', { style: S.status }, '当前：' + (native.openNative ? '已开启' : '未开启')
+            + ' · 只开文件夹 ' + (native.folderOnlyExts || []).length + ' 项'
+            + ' · 只开程序 ' + (native.programOnlyExts || []).length + ' 项'
+            + (native.saving || native.savingExts ? ' · 保存中…' : '')
+            + ' · 保存即时生效'),
           native.message ? el('div', { style: S.note }, native.message) : null,
           native.error ? el('div', { style: S.warn }, native.error) : null,
           native.compatibility ? el('div', { style: S.warn }, native.compatibility) : null),
@@ -1293,15 +1430,16 @@ window.__ModuleLoader__.load({
                 void saveForceStopSetting(next).then(problem => setForceStopMessage(problem ? '保存失败：' + problem : '已保存，即时生效。'));
               },
             })),
-          el('div', { style: S.desc }, '开启后，对话输入框下方的状态栏多一条「运行时长 + 强制终止」：运行时长按本轮 turn 的真实起点计时（刷新页面不跳表）；点「强制终止」需点两次确认，会先发官方中止信号，再清理该会话的后台任务、终端进程和子代理，用来对付「暂停按了没反应」的卡住。关闭后这条状态栏完全不显示。'),
+          el('div', { style: S.desc }, '开启后，对话输入框下方的状态栏多一条「运行时长 + 强制终止」：运行时长按本轮 turn 的真实起点计时（刷新页面不跳表）；点一下「强制终止」立即触发（没有二次确认，误点就会中断本轮并丢弃未完成的输出），会先发官方中止信号，再清理该会话的后台任务、终端进程和子代理，用来对付「暂停按了没反应」的卡住。点完若 8 秒内还在跑，状态栏会多出「仍在运行 · 重启 DSH」——那是最后兜底，单击即重启，会连同其它会话一起重启、页面断开几秒。关闭后这条状态栏完全不显示。'),
           el('div', { style: S.status }, '当前：' + (forceStop.enabled ? '已开启' : '未开启') + ' · 保存即时生效'),
           forceStopMessage ? el('div', { style: S.note }, forceStopMessage) : null),
+        el(CookieCleanCard, {}),
         el(VisibleShellCard, {}),
         el(ProxyCard, {}),
         el(BalanceCard, {}),
         el('div', { style: S.card },
           el('div', { style: S.title }, '说明'),
-          el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；「隐藏 API」与「全局规则」保存后仍按原逻辑自动重启；「打开资源管理器和程序」只保存 state.json，立即生效，不触发重启。规则正文（含思维链那句）统一写在 GLOBAL-RULES.md，改完点「重新注入」。以后要加别的个人开关，往这里加卡片即可。')));
+          el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；「隐藏 API」与「全局规则」保存后仍按原逻辑自动重启；「打开资源管理器和程序」的开关与两个扩展名名单都只保存 state.json，立即生效，不触发重启。规则正文（含思维链那句）统一写在 GLOBAL-RULES.md，改完点「重新注入」。以后要加别的个人开关，往这里加卡片即可。')));
     }
 
     /**
@@ -1309,6 +1447,88 @@ window.__ModuleLoader__.load({
      * 余额行渲染在同一列内的正上方——slot 容器是横向 flex，独立注册会被排成左右并排，
      * 所以这里让代理组件自己竖排两行，代理保持左对齐。
      */
+    /* ---------------- 认证 Cookie 自动清理：开关 + 阈值 + 保留条数 ---------------- */
+    function CookieCleanCard() {
+      const [state, setState] = useState({ enabled: true, keep: 2, min: 30, report: null });
+      const [minInput, setMinInput] = useState('30');
+      const [keepInput, setKeepInput] = useState('2');
+      const [message, setMessage] = useState('');
+      const [saving, setSaving] = useState(false);
+
+      useEffect(() => {
+        let alive = true;
+        void fetch(API + '/state', { cache: 'no-store' })
+          .then(response => response.json())
+          .then(data => {
+            if (!alive || !data || !data.ok) return;
+            const keep = Number.isFinite(Number(data.cookieKeep)) ? Number(data.cookieKeep) : 2;
+            const min = Number.isFinite(Number(data.cookieCleanMin)) ? Number(data.cookieCleanMin) : 30;
+            setState({ enabled: data.cookieAutoClean !== false, keep, min, report: data.cookieCleanup || null });
+            setKeepInput(String(keep));
+            setMinInput(String(min));
+          })
+          .catch(() => {});
+        return () => { alive = false; };
+      }, []);
+
+      async function save(patch) {
+        setSaving(true);
+        try {
+          const response = await fetch(API + '/cookie-clean', {
+            method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch),
+          });
+          const data = await response.json();
+          if (!data || !data.ok) throw new Error((data && data.error) || ('HTTP ' + response.status));
+          setState(current => ({ ...current, enabled: data.cookieAutoClean !== false, keep: data.cookieKeep, min: data.cookieCleanMin, report: data.cookieCleanup || current.report }));
+          setKeepInput(String(data.cookieKeep));
+          setMinInput(String(data.cookieCleanMin));
+          setMessage('已保存，下次关闭应用时按新设置执行。');
+        } catch (error) {
+          setMessage('保存失败：' + String(error && error.message ? error.message : error));
+        } finally {
+          setSaving(false);
+        }
+      }
+
+      const report = state.report;
+      const reportText = !report
+        ? '还没有清理记录'
+        : report.skipped === 'disabled'
+          ? '上次关闭：自动清理已关闭，未执行'
+          : report.skipped === 'below-min'
+            ? '上次关闭：共 ' + report.found + ' 条，未超过阈值 ' + (report.min || state.min) + '，未清理'
+            : report.ok
+              ? '上次关闭：共 ' + report.found + ' 条，删除 ' + report.removed + ' 条，保留 ' + report.kept + ' 条'
+              : '上次清理失败：' + (report.error || report.reason || '未知');
+
+      return el('div', { style: S.card },
+        el('div', { style: S.head },
+          el('div', { style: S.title }, '自动清理旧认证 Cookie'),
+          el(Switch, {
+            checked: state.enabled,
+            disabled: saving,
+            label: '自动清理旧认证 Cookie',
+            onChange: event => { setMessage(''); void save({ enabled: event.target.checked }); },
+          })),
+        el('div', { style: S.desc }, '本地认证 Cookie 的名字里带端口，而应用每次启动端口都不同，所以每次启动都会多一条；浏览器又不按端口隔离，请求时会把它们全部带上。攒到约 70 条就会顶破请求头上限，导致启动失败（Web authentication failed）。开启后，每次关闭应用都会自动删掉旧记录。'),
+        el('div', { style: { display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' } },
+          el('span', { style: { fontSize: 12, opacity: 0.7 } }, '超过此条数才清理'),
+          el('input', {
+            type: 'number', value: minInput, min: 1, max: 1000,
+            onChange: event => setMinInput(event.target.value),
+            style: { width: 90, padding: '5px 8px', borderRadius: 8, border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: 13 },
+          }),
+          el('span', { style: { fontSize: 12, opacity: 0.7, marginLeft: 6 } }, '清理后保留'),
+          el('input', {
+            type: 'number', value: keepInput, min: 1, max: 10,
+            onChange: event => setKeepInput(event.target.value),
+            style: { width: 70, padding: '5px 8px', borderRadius: 8, border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: 13 },
+          }),
+          el('button', { style: S.btn, disabled: saving, onClick: () => { setMessage(''); void save({ min: Number(minInput), keep: Number(keepInput) }); } }, '保存')),
+        el('div', { style: S.status }, reportText + (saving ? ' · 保存中…' : '') + ' · 关闭应用后执行'),
+        message ? el('div', { style: S.note }, message) : null);
+    }
+
     function ProxyStatusBadge(props) {
       const wide = props.wide !== false;
       const store = useProxyStatus();
@@ -1682,6 +1902,9 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** 点了强制终止后，超过这么久会话仍在运行，就亮出「重启 DSH」保底按钮。 */
+    const FORCE_STOP_STALL_MS = 8000;
+
     function formatRunDuration(startedAt, now) {
       const total = Math.max(0, Math.floor((now - startedAt) / 1000));
       const minutes = Math.floor(total / 60);
@@ -1703,6 +1926,9 @@ window.__ModuleLoader__.load({
       const [phase, setPhase] = useState('idle');
       const [hover, setHover] = useState(false);
       const [message, setMessage] = useState('');
+      /** 最近一次点「强制终止」的时间点；到点还没停下来就进保底状态。 */
+      const [stallAt, setStallAt] = useState(0);
+      const [restarting, setRestarting] = useState(false);
       const actionTimer = React.useRef(null);
 
       useEffect(() => {
@@ -1715,7 +1941,13 @@ window.__ModuleLoader__.load({
             if (!alive || !data || !data.ok) return;
             const next = { running: data.running === true, startedAt: Number(data.startedAt) || 0 };
             setClock(current => (current.running === next.running && current.startedAt === next.startedAt ? current : next));
-            if (next.running) setNow(Date.now());
+            if (next.running) {
+              setNow(Date.now());
+            } else {
+              // 只有真的读到「不跑了」才算终止完成，避免乐观更新把还在跑的会话藏掉。
+              setPhase(current => (current === 'stopping' || current === 'stalled' ? 'done' : current));
+              setStallAt(0);
+            }
           } catch { /* 单次失败忽略，下轮再试 */ }
         };
         void poll();
@@ -1731,14 +1963,35 @@ window.__ModuleLoader__.load({
 
       useEffect(() => () => { if (actionTimer.current) clearTimeout(actionTimer.current); }, []);
 
+      /** phase 落到 done 后 4 秒复位；保底状态（stalled）不自动消失，等人处置。 */
+      useEffect(() => {
+        if (phase !== 'done') return undefined;
+        if (actionTimer.current) clearTimeout(actionTimer.current);
+        actionTimer.current = setTimeout(() => { setPhase('idle'); setMessage(''); }, 4000);
+        return () => { if (actionTimer.current) clearTimeout(actionTimer.current); };
+      }, [phase]);
+
+      /** 保底：点了终止若干秒仍未停止，就亮出「重启 DSH」按钮。 */
+      useEffect(() => {
+        if (!stallAt) return undefined;
+        const timer = setInterval(() => {
+          if (Date.now() - stallAt < FORCE_STOP_STALL_MS) return;
+          setStallAt(0);
+          setPhase(current => (current === 'stopping' ? 'stalled' : current));
+        }, 500);
+        return () => clearInterval(timer);
+      }, [stallAt]);
+
       function clearActionTimer() {
         if (actionTimer.current) { clearTimeout(actionTimer.current); actionTimer.current = null; }
       }
 
       async function stop() {
+        if (restarting) return;
         clearActionTimer();
         setPhase('stopping');
         setMessage('');
+        setStallAt(Date.now());
         try {
           const response = await fetch(API + '/force-stop', {
             method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId }),
@@ -1746,31 +1999,39 @@ window.__ModuleLoader__.load({
           const data = await response.json();
           if (!data || !data.ok) throw new Error((data && data.error) || ('HTTP ' + response.status));
           const problems = (Array.isArray(data.steps) ? data.steps : []).filter(step => step && step.ok !== true && step.detail);
-          setPhase('done');
-          setClock(current => ({ ...current, running: false }));
+          // 不再乐观地把 running 改 false：停没停以轮询结果为准，没停就交给下面的保底。
           setMessage(problems.length
             ? '部分未完成：' + problems.map(step => step.name + ' ' + step.detail).join('；')
             : '已发出强制终止');
-          actionTimer.current = setTimeout(() => { setPhase('idle'); setMessage(''); }, 4000);
         } catch (error) {
           setPhase('idle');
+          setStallAt(0);
           setMessage('强制终止失败：' + String(error && error.message ? error.message : error));
         }
       }
 
+      /** 最后兜底：重启 DSH。单击即重启——会连同其它会话一起重启，页面断开几秒。 */
+      async function restartNow() {
+        if (restarting) return;
+        setRestarting(true);
+        setMessage('正在重启，页面稍后会断开…');
+        try {
+          await fetch(API + '/restart', { method: 'POST' });
+        } catch { /* 重启时连接先断是正常的 */ }
+        // 真重启了页面就断了；8 秒还活着说明没成功，把按钮放回来。
+        setTimeout(() => setRestarting(false), 8000);
+      }
+
+      /** 点击即触发：不做二次确认，误点会直接丢弃本轮未完成的输出。 */
       function onPress() {
         if (phase === 'stopping' || phase === 'done') return;
-        if (phase === 'confirm') { void stop(); return; }
-        setPhase('confirm');
-        setMessage('');
-        clearActionTimer();
-        actionTimer.current = setTimeout(() => setPhase('idle'), 3000);
+        void stop();
       }
 
       if (!setting.enabled) return null;
-      if (!clock.running && phase !== 'stopping' && phase !== 'done') return null;
+      if (!clock.running && phase !== 'stopping' && phase !== 'done' && phase !== 'stalled') return null;
 
-      const label = phase === 'confirm' ? '确认终止？' : phase === 'stopping' ? '终止中…' : phase === 'done' ? '已终止' : '强制终止';
+      const label = phase === 'stopping' ? '终止中…' : phase === 'done' ? '已终止' : '强制终止';
       const duration = clock.running && clock.startedAt ? formatRunDuration(clock.startedAt, now) : '';
 
       return el('span', {
@@ -1792,7 +2053,7 @@ window.__ModuleLoader__.load({
           el('span', null, duration ? '运行 ' + duration : '运行中')),
         el('button', {
           type: 'button',
-          title: phase === 'confirm' ? '再点一次确认强制终止（会丢弃本轮未完成的输出）' : '强制终止：中止本轮，并清理该会话的后台任务、终端、子代理',
+          title: '强制终止：立即中止本轮（会丢弃未完成的输出），并清理该会话的后台任务、终端、子代理',
           'aria-label': '强制终止当前任务',
           disabled: phase === 'stopping' || phase === 'done',
           onClick: onPress,
@@ -1801,8 +2062,7 @@ window.__ModuleLoader__.load({
           style: {
             display: 'inline-flex', alignItems: 'center',
             border: '1px solid var(--dsw-alias-state-error-primary, #c0392b)',
-            background: phase === 'confirm' ? 'rgba(192,57,43,0.18)'
-              : hover ? 'rgba(192,57,43,0.10)' : 'transparent',
+            background: hover ? 'rgba(192,57,43,0.10)' : 'transparent',
             color: 'var(--dsw-alias-state-error-primary, #c0392b)',
             opacity: phase === 'stopping' || phase === 'done' ? 0.6 : 1,
             borderRadius: 'var(--dsw-radius-sm, 6px)',
@@ -1811,6 +2071,30 @@ window.__ModuleLoader__.load({
             fontFamily: 'inherit', whiteSpace: 'nowrap',
           },
         }, label),
+        phase === 'stalled'
+          ? el('span', {
+            style: { display: 'inline-flex', alignItems: 'center', gap: 6, color: 'var(--dsw-alias-state-warning-primary, #b7791f)' },
+          },
+            el('span', null, '仍在运行'),
+            el('button', {
+              type: 'button',
+              title: '重启 DSH：会连同其它会话一起重启，页面断开几秒；专门用来救「终止了也不停」的死结',
+              'aria-label': '重启 DSH',
+              disabled: restarting,
+              onClick: () => { void restartNow(); },
+              style: {
+                display: 'inline-flex', alignItems: 'center',
+                border: '1px solid var(--dsw-alias-state-error-primary, #c0392b)',
+                background: 'rgba(192,57,43,0.10)',
+                color: 'var(--dsw-alias-state-error-primary, #c0392b)',
+                opacity: restarting ? 0.6 : 1,
+                borderRadius: 'var(--dsw-radius-sm, 6px)',
+                padding: '1px 8px', fontSize: 'inherit', lineHeight: 'inherit',
+                cursor: restarting ? 'default' : 'pointer',
+                fontFamily: 'inherit', whiteSpace: 'nowrap',
+              },
+            }, restarting ? '重启中…' : '重启 DSH'))
+          : null,
         message
           ? el('span', {
             title: message,

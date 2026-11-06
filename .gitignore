@@ -4,3 +4,4 @@ proxy.json
 proxy-data/
 *.bak-*
 vendor/
+cookie-cleanup.json

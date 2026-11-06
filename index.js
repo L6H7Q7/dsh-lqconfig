@@ -6,7 +6,9 @@
  *   2. 全局规则——把 GLOBAL-RULES.md 压成单行注入三个 preset 的 persona.prefix（系统提示前段），带备份
  *   3. 重启应用（确认后由本进程拉起外部脚本：延时 → 结束进程 → 重新启动）
  *
- *   4. 打开资源管理器和程序——状态只写同目录 state.json，默认关闭，不需重启
+ *   4. 打开资源管理器和程序——状态只写同目录 state.json，默认关闭，不需重启；
+ *      其下的两个扩展名名单（只开文件夹 / 只开程序）同样只写 state.json：
+ *      名单外的文件两路都做，命中名单即固定单路（apk 只定位 → 不会拉起模拟器）
  *
  * 路由前缀：/dsh-lqconfig/api/*（同源 HTTP，供设置页「LQ配置」使用）
  */
@@ -152,10 +154,99 @@ function hostService(name) {
   }
 }
 
+/*
+ * 扩展名名单：名单外一律「两路都做」（默认程序 + 资源管理器），名单命中即固定单路。
+ *   folderOnlyExts  —— 只打开文件夹并选中，绝不调用默认程序（apk → 不会启动模拟器）
+ *   programOnlyExts —— 只调用默认程序，不再弹资源管理器（exe/bat 等执行型）
+ * 两个名单互斥：同一个扩展名不允许同时出现在两边，写入时校验。
+ * 缺键或旧版没写过时回落内置默认：apk 进文件夹名单，执行型进程序名单。
+ */
+const EXT_LIST_MAX = 32;
+const EXT_NAME_RE = /^[a-z0-9][a-z0-9.]{0,15}$/u;
+const DEFAULT_FOLDER_ONLY_EXTS = ['apk'];
+const DEFAULT_PROGRAM_ONLY_EXTS = ['exe', 'com', 'bat', 'cmd', 'vbs', 'vbe', 'ps1', 'msi', 'lnk', 'scr'];
+const NATIVE_OPERATIONS_DEFAULT = ['program', 'explorer'];
+
+/** 宽松清洗（读用）：小写、去前导点、丢弃非法项、去重、截断。 */
+function sanitizeExtList(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const item of value) {
+    if (typeof item !== 'string') continue;
+    const ext = item.trim().toLowerCase().replace(/^\.+/u, '');
+    if (!ext || !EXT_NAME_RE.test(ext) || seen.has(ext)) continue;
+    seen.add(ext);
+    out.push(ext);
+    if (out.length >= EXT_LIST_MAX) break;
+  }
+  return out;
+}
+
+/** 严格校验（写用）：有任何一项不合法就整体拒绝，不静默丢用户输入。 */
+function validateExtList(value, label) {
+  if (!Array.isArray(value)) throw new Error(label + '必须是数组');
+  if (value.length > EXT_LIST_MAX) throw new Error(label + '最多 ' + EXT_LIST_MAX + ' 项');
+  const seen = new Set();
+  return value.map((item) => {
+    if (typeof item !== 'string') throw new Error(label + '只能包含字符串');
+    const ext = item.trim().toLowerCase().replace(/^\.+/u, '');
+    if (!ext) throw new Error(label + '里有空项');
+    if (!EXT_NAME_RE.test(ext)) throw new Error(label + '里的「' + item + '」不是合法扩展名（只能字母、数字、点）');
+    if (seen.has(ext)) throw new Error(label + '里的「' + ext + '」重复');
+    seen.add(ext);
+    return ext;
+  });
+}
+
+export async function readExtLists() {
+  const value = await readStateFile();
+  return {
+    folderOnlyExts: value.folderOnlyExts === undefined ? [...DEFAULT_FOLDER_ONLY_EXTS] : sanitizeExtList(value.folderOnlyExts),
+    programOnlyExts: value.programOnlyExts === undefined ? [...DEFAULT_PROGRAM_ONLY_EXTS] : sanitizeExtList(value.programOnlyExts),
+  };
+}
+
+/** 名单写入：互斥校验 + 合并写回，不碰 state.json 其余键。 */
+export async function writeExtLists(patch) {
+  const current = await readExtLists();
+  const next = { ...current };
+  if (patch.folderOnlyExts !== undefined) next.folderOnlyExts = validateExtList(patch.folderOnlyExts, '只开文件夹名单');
+  if (patch.programOnlyExts !== undefined) next.programOnlyExts = validateExtList(patch.programOnlyExts, '只开程序名单');
+  const overlap = next.folderOnlyExts.filter(ext => next.programOnlyExts.includes(ext));
+  if (overlap.length) {
+    throw new Error('这些扩展名同时出现在两个名单里：' + overlap.join('、') + '；一个扩展名只能选一边');
+  }
+  const state = await readStateFile();
+  state.folderOnlyExts = next.folderOnlyExts;
+  state.programOnlyExts = next.programOnlyExts;
+  await fs.writeFile(nativeStatePath, JSON.stringify(state, null, 2) + '\n', 'utf8');
+  return next;
+}
+
+/** 目标文件的扩展名（不含点，小写）；无扩展名返回空串。 */
+export function extensionOf(target) {
+  const base = path.win32.basename(String(target));
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0 || dot === base.length - 1) return '';
+  return base.slice(dot + 1).toLowerCase();
+}
+
+/** 名单 → 这次请求要走哪几路；名单外两路都走。目录恒为单路（见 openNativePath）。 */
+export function operationsForTarget(target, lists) {
+  const ext = extensionOf(target);
+  if (ext && lists.folderOnlyExts.includes(ext)) return ['explorer'];
+  if (ext && lists.programOnlyExts.includes(ext)) return ['program'];
+  return [...NATIVE_OPERATIONS_DEFAULT];
+}
+
 export async function readNativeSettings() {
   let text;
   try { text = await fs.readFile(nativeStatePath, 'utf8'); }
-  catch (error) { if (error.code === 'ENOENT') return { openNative: false }; throw error; }
+  catch (error) {
+    if (error.code === 'ENOENT') return { openNative: false };
+    throw error;
+  }
   const value = JSON.parse(text.replace(/^\uFEFF/, ''));
   if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.openNative !== 'boolean') {
     throw new Error('系统打开设置格式无效：state.json 的 openNative 必须是布尔值');
@@ -544,14 +635,8 @@ function nativeOperationError(error) {
   };
 }
 
-const EXECUTABLE_EXT_RE = /\.(?:exe|com|bat|cmd|vbs|vbe|ps1|msi|lnk|scr)$/iu;
-
-export async function openNativePath(value, operations = ['program', 'explorer']) {
+export async function openNativePath(value, requested) {
   const target = validateNativePath(value);
-  // 执行型文件只启动程序本身；再弹一个资源管理器定位没有任何意义。
-  const effective = EXECUTABLE_EXT_RE.test(target) && operations.includes('program')
-    ? ['program']
-    : operations;
   let stat, statError;
   try {
     stat = await fs.stat(target);
@@ -563,6 +648,15 @@ export async function openNativePath(value, operations = ['program', 'explorer']
       ? '路径不存在：' + target : '无法访问路径：' + cause.message);
     statError.code = cause.code || 'path-unavailable';
     statError.submitted = false;
+  }
+  // 目录永远只有「打开文件夹」一路（过去两路都会开窗口）；文件按扩展名名单决定，名单外两路都走。
+  const lists = await readExtLists();
+  const fixed = stat && stat.isDirectory() ? ['explorer'] : operationsForTarget(target, lists);
+  // requested 只在重试时作为「已知失败的那一路」传来，必须是 fixed 的子集，名单限制不可被绕过。
+  let effective = fixed;
+  if (Array.isArray(requested) && requested.length) {
+    const subset = requested.filter(operation => fixed.includes(operation));
+    if (subset.length) effective = subset;
   }
   // Start both intentions now. Neither launch waits for the other to fail.
   // Explicit retries can request only the operation that did not complete.
@@ -806,6 +900,7 @@ async function promptChars(file) {
 
 export async function readState() {
   const file = patchPath();
+  const cookieSettings = await readCookieCleanupSettings();
   const exists = existsSync(file);
   const text = exists ? await fs.readFile(file, 'utf8') : '';
   return {
@@ -819,9 +914,14 @@ export async function readState() {
     awakeningLiteChars: await promptChars(AWAKENING_LITE_FILE),
     rulesPath: RULES_FILE,
     ...(await readNativeSettings()),
+    ...(await readExtLists()),
     balanceBadge: await readBalanceBadge(),
     balanceIntervalMinutes: await readBalanceInterval(),
     forceStop: await readForceStopEnabled(),
+    cookieAutoClean: cookieSettings.enabled,
+    cookieKeep: cookieSettings.keep,
+    cookieCleanMin: cookieSettings.min,
+    cookieCleanup: await readCookieCleanupReport(),
     exists,
     patchPath: file,
     exe: exePath(),
@@ -1103,6 +1203,84 @@ let exitHookInstalled = false;
 /** 启动后多久预热代理（毫秒）。延迟避开 DSH 启动高峰，失败不影响启动。 */
 const WARMUP_DELAY_MS = 8000;
 
+
+// —— 本地认证 Cookie：应用关闭后清理 ——
+// 为什么不在运行时清：应用运行时 Network\Cookies 被 Chromium 独占锁定；host 插件又跑在
+// ELECTRON_RUN_AS_NODE 的独立进程里，拿不到 Electron 的 session API（已实测失败）。
+// 做法：启动时拉起一个脱离父进程的 python 清理器，stdin 接在 host 的管道上；host 退出
+// （含被强杀）时管道关闭，清理器再动手，此时数据库已解锁。
+// 背景：dsh-auth-* 的名字绑了 host:port、桌面版每次启动端口随机、浏览器又不按端口隔离
+// Cookie，于是每启动一次多一条，攒到约 70 条会顶破 Node 的 16 KB 请求头上限。
+
+const COOKIE_CLEANUP_REPORT = fileURLToPath(new URL('./cookie-cleanup.json', import.meta.url));
+const COOKIE_CLEANUP_HELPER = fileURLToPath(new URL('./cleanup-cookies.py', import.meta.url));
+
+async function readCookieCleanupSettings() {
+  const value = await readStateFile();
+  const rawKeep = Number.isFinite(value.cookieKeep) ? Math.trunc(value.cookieKeep) : 2;
+  const rawMin = Number.isFinite(value.cookieCleanMin) ? Math.trunc(value.cookieCleanMin) : 30;
+  return {
+    enabled: value.cookieAutoClean !== false,
+    keep: Math.max(1, Math.min(10, rawKeep)),
+    min: Math.max(1, Math.min(1000, rawMin)),
+  };
+}
+
+async function readCookieCleanupReport() {
+  try {
+    const text = await fs.readFile(COOKIE_CLEANUP_REPORT, 'utf8');
+    return JSON.parse(text.replace(/^\uFEFF/, ''));
+  } catch {
+    return null;
+  }
+}
+
+function resolveRuntimePython() {
+  const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+  const bundled = path.join(home, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'python', 'python.exe');
+  if (existsSync(bundled)) return bundled;
+  return 'python.exe';
+}
+
+async function writeCookieCleanupSettings(patch) {
+  const current = await readStateFile();
+  if (typeof patch.enabled === 'boolean') current.cookieAutoClean = patch.enabled;
+  if (Number.isFinite(patch.keep)) current.cookieKeep = Math.max(1, Math.min(10, Math.trunc(patch.keep)));
+  if (Number.isFinite(patch.min)) current.cookieCleanMin = Math.max(1, Math.min(1000, Math.trunc(patch.min)));
+  await fs.writeFile(nativeStatePath, JSON.stringify(current, null, 2) + '\n', 'utf8');
+  return readCookieCleanupSettings();
+}
+
+let cookieWatcher = null;
+
+/** 停掉守护进程（开关关闭或插件卸载时调用）。 */
+function stopCookieCleanupWatcher() {
+  if (!cookieWatcher) return false;
+  try { cookieWatcher.kill(); } catch { /* 尽力而为 */ }
+  cookieWatcher = null;
+  return true;
+}
+
+/** 按开关状态拉起或停掉守护进程：开=在跑，关=不跑。 */
+function ensureCookieCleanupWatcher(enabled) {
+  if (!enabled) return stopCookieCleanupWatcher();
+  if (cookieWatcher) return false;
+  try {
+    const child = spawn(
+      resolveRuntimePython(),
+      [COOKIE_CLEANUP_HELPER, '--state', nativeStatePath, '--report', COOKIE_CLEANUP_REPORT],
+      { detached: true, stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true },
+    );
+    child.on('error', () => {});
+    child.on('exit', () => { if (cookieWatcher === child) cookieWatcher = null; });
+    child.unref();
+    cookieWatcher = child;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function apply(ctx) {
   pluginContext = ctx;
   ctx.effect(() => () => { if (pluginContext === ctx) pluginContext = null; }, 'dsh-lqconfig: host context');
@@ -1126,6 +1304,18 @@ export function apply(ctx) {
       });
   }, WARMUP_DELAY_MS);
   ctx.effect(() => () => { if (warmupTimer !== null) { clearTimeout(warmupTimer); warmupTimer = null; } }, 'dsh-lqconfig: proxy warmup');
+
+  // 拉起“关闭后清理”守护进程；state.json 里 cookieAutoClean=false 可关闭
+  ctx.effect(() => {
+    let disposed = false;
+    void readCookieCleanupSettings()
+      .then((settings) => {
+        if (disposed) return;
+        ensureCookieCleanupWatcher(settings.enabled);
+      })
+      .catch(() => {});
+    return () => { disposed = true; stopCookieCleanupWatcher(); };
+  }, 'dsh-lqconfig: cookie cleanup watcher');
   // 关窗口/退应用时即使插件 Dispose 没跑到，Node 退出也会同步收尾
   if (!exitHookInstalled) {
     exitHookInstalled = true;
@@ -1220,17 +1410,33 @@ export function apply(ctx) {
               }
               const body = await readBody(req);
               if (route === '/api/native-setting') {
-                if (typeof body.enabled !== 'boolean') return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
-                return sendJson(res, 200, { ok: true, ...(await writeNativeSettings(body.enabled)) });
+                const hasEnabled = typeof body.enabled === 'boolean';
+                const hasLists = body.folderOnlyExts !== undefined || body.programOnlyExts !== undefined;
+                if (body.enabled !== undefined && !hasEnabled) return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+                if (!hasEnabled && !hasLists) return sendJson(res, 400, { ok: false, error: '需要 enabled 或扩展名名单' });
+                const result = {};
+                if (hasEnabled) Object.assign(result, await writeNativeSettings(body.enabled));
+                if (hasLists) {
+                  try {
+                    Object.assign(result, await writeExtLists({
+                      folderOnlyExts: body.folderOnlyExts,
+                      programOnlyExts: body.programOnlyExts,
+                    }));
+                  } catch (error) {
+                    return sendJson(res, 400, { ok: false, error: String(error && error.message ? error.message : error) });
+                  }
+                }
+                return sendJson(res, 200, { ok: true, ...result, ...(await readNativeSettings()), ...(await readExtLists()) });
               }
-              if (!(await readNativeSettings()).openNative) {
+              const nativeSettings = await readNativeSettings();
+              if (!nativeSettings.openNative) {
                 return sendJson(res, 409, { ok: false, code: 'native-disabled', submitted: false, displayed: null, error: '系统打开开关已关闭' });
               }
               try { validateNativePath(body.path); }
               catch (error) { return sendJson(res, 400, { ok: false, submitted: false, displayed: null, error: error.message }); }
-              const operations = body.operations ?? ['program', 'explorer'];
-              if (!Array.isArray(operations) || operations.length === 0 || operations.length > 2 ||
-                  new Set(operations).size !== operations.length || operations.some(value => value !== 'program' && value !== 'explorer')) {
+              const operations = body.operations;
+              if (operations !== undefined && (!Array.isArray(operations) || operations.length === 0 || operations.length > 2 ||
+                  new Set(operations).size !== operations.length || operations.some(value => value !== 'program' && value !== 'explorer'))) {
                 return sendJson(res, 400, { ok: false, error: 'operations 仅接受 program、explorer' });
               }
               const result = await openNativePath(body.path, operations);
@@ -1316,6 +1522,25 @@ export function apply(ctx) {
               const body = await readBody(req);
               if (typeof body.enabled !== 'boolean') return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
               return sendJson(res, 200, { ok: true, ...(await writeForceStopEnabled(body.enabled)), ...(await readState()) });
+            }
+            if (req.method === 'POST' && route === '/api/cookie-clean') {
+              const body = await readBody(req);
+              const patch = {};
+              if (typeof body.enabled === 'boolean') patch.enabled = body.enabled;
+              const keep = Number(body.keep);
+              if (Number.isFinite(keep)) patch.keep = keep;
+              const min = Number(body.min);
+              if (Number.isFinite(min)) patch.min = min;
+              const saved = await writeCookieCleanupSettings(patch);
+              // 开关变化即时生效：开→拉起，关→结束
+              ensureCookieCleanupWatcher(saved.enabled);
+              return sendJson(res, 200, {
+                ok: true,
+                cookieAutoClean: saved.enabled,
+                cookieKeep: saved.keep,
+                cookieCleanMin: saved.min,
+                cookieCleanup: await readCookieCleanupReport(),
+              });
             }
             if (req.method === 'POST' && route === '/api/restart') {
               return sendJson(res, 200, { ok: true, ...(await restartApp()) });
