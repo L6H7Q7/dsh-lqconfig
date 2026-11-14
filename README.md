@@ -2,6 +2,33 @@
 
 个人用的 DSH 插件，在「设置」里提供 **LQ配置** 分区，集中放自己的小开关。
 
+## 项目介绍
+
+这是一个给 [DeepSeek Harness](https://www.deepseek.com/harness/)（简称 DSH）用的**本地插件**，把一批日常自用的小开关和代理能力收进一个面板，避免在多个工具/配置文件之间来回改。
+
+它解决的问题很具体：
+
+- DSH 默认走直连，国内访问境外模型/服务不稳定 → 插件内置 mihomo 内核和机场订阅，按需提供本地代理，**启动自动开、退出自动收尾**，不会留下指向死端口的断网配置。
+- 每次都要手写「用中文思考」之类的系统提示 → 插件把 `GLOBAL-RULES.md` 压成一行注入 Agent 预设，并支持三档提示词模式一键切换。
+- 想看余额、想清 Cookie、想快速打开本地目录 → 都收进同一个面板和侧边栏。
+
+主要能力一览：
+
+| 能力 | 说明 |
+|---|---|
+| 机场代理 | 内置 mihomo v1.19.33 内核 + 订阅；8 秒预热（可配）、看门狗兜底、`GEOIP,CN,DIRECT` 国内直连分流、订阅定时刷新 |
+| 系统代理开关 | 左下角「运行中 / 已关闭」秒切，只切开关不动内核；DSH 退出或异常退出时自动还原 |
+| 全局规则 | 把 `GLOBAL-RULES.md` 注入三个 Agent 预设的 `persona.prefix`，固定思考语言等规则 |
+| 提示词模式 | 正常 / 进化（lite 6 类）/ 觉醒（完整 25 类），切换后自动重启生效 |
+| 余额常驻显示 | 侧边栏底部显示余额，点击刷新 |
+| Cookie 清理 | 关闭应用后自动清理旧认证 Cookie，阈值与保留条数可调 |
+| 资源快捷打开 | 设置页开关 + 左下角入口，按固定路径打开程序/文件夹并置顶窗口 |
+| 隐藏自带 API | 用自定义模型供应商替代 DSH 内置 DeepSeek 通道 |
+
+设计原则：**全部状态只存本地 JSON，不联网上报**；所有会改动系统的地方（注册表代理、preset 补丁）都带备份和还原路径。
+
+> 个人插件，界面固定中文，仅适配 **Windows x64**（内置 `mihomo.exe` 与 PowerShell 脚本）。
+
 ## 功能
 
 - **隐藏 API**（滑块）：等价于在 `profiles/desktop/cordis.patch.yml` 写入
@@ -40,6 +67,40 @@
   `ELECTRON_RUN_AS_NODE` 后拉 EXE，按 PID 逐个杀（排除助手自己，避免
   `taskkill /f /im` 把助手一起杀掉导致「只关闭不重启」），再校验新实例是否真的起来，
   失败走 `cmd /c start` 兜底。全过程写 `%TEMP%\dsh-lqconfig-restart.log`。
+
+## 前置：安装 DeepSeek Harness
+
+本插件只是 DSH 的一个本地插件，**先装好 DSH 本体**才能用。当前测试版为 0.2.x，三种装法：
+
+### 方式一：桌面版（推荐，不用装 Node.js）
+
+| 平台 | 下载 |
+|---|---|
+| Windows x64 | <https://download.deepseek.com/desktop/dsh-latest-windows-x64.exe>（约 265 MB） |
+| macOS Apple 芯片 | <https://download.deepseek.com/desktop/dsh-latest-macos-arm64.dmg> |
+| macOS Intel | <https://download.deepseek.com/desktop/dsh-latest-macos-x64.dmg> |
+
+下载后双击安装（Windows 安装到当前用户，可自选目录），打开应用 → 「设置 → 模型」填入自己的 API Key 即可开始使用。桌面版自带运行环境，**不需要预装 Node.js**。
+
+### 方式二：命令行 / 网页版（需要 Node.js）
+
+```bash
+npx @deepseek-ai/dsh web
+```
+
+启动后按终端提示的地址在浏览器打开。适合开发者和远程服务器。
+
+### 方式三：从源码安装
+
+```bash
+git clone https://github.com/deepseek-ai/deepseek-harness
+```
+
+按仓库内说明完成依赖安装与构建。
+
+> 官方入口与最新版本以 <https://www.deepseek.com/harness/> 为准。
+
+装好 DSH 后，继续下一步安装本插件。
 
 ## 安装
 
