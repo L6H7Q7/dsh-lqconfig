@@ -19,6 +19,7 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as proxy from './proxy.js';
+import * as sysproxy from './system-proxy.js';
 
 export const name = 'dsh-lqconfig';
 export const inject = ['webServer'];
@@ -696,18 +697,30 @@ export function isSessionId(value) {
 
 const turnClockCache = new Map();
 const TURN_CLOCK_CACHE_MS = 3000;
-/** 运行中读事件找 turn 起点较重：同一轮内 30 秒才重读一次，其余时间复用上次起点。 */
+/** 同一轮内 turn 起点是常量：30 秒才校验一次，其余时间复用上次结果。 */
 const TURN_START_REFRESH_MS = 30000;
 
-function lastTurnStart(events) {
-  if (!Array.isArray(events)) return 0;
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index];
+/** 事件记录有两种形态：{type:'event',event:{...}} 或事件本体，两种都认。 */
+function lastTurnStart(records) {
+  if (!Array.isArray(records)) return 0;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const entry = records[index];
+    const event = entry && entry.event ? entry.event : entry;
     if (!event || event.type !== 'turn/start') continue;
     const time = Number(event.time);
-    return Number.isFinite(time) && time > 0 ? time : 0;
+    if (Number.isFinite(time) && time > 0) return time;
   }
   return 0;
+}
+
+/** 读本会话最近一页事件，取「本轮 turn 的真实起点」。 */
+async function readTurnStartedAt(controller, sessionId) {
+  const page = await controller.events({
+    address: { kind: 'session', sessionId },
+    maxMessages: 1,
+    turnWindow: { minMessages: 1, minTurns: 1 },
+  }, new AbortController().signal);
+  return lastTurnStart(page && page.records);
 }
 
 /** 读当前会话的「是否在运行 + 本 turn 起点」：列表定运行态，事件定起点，结果缓存 3 秒。 */
@@ -737,24 +750,38 @@ export async function readTurnClock(sessionId) {
     report.error = error instanceof Error ? error.message : String(error);
   }
 
-  let inspectedAt = cached ? cached.inspectedAt : 0;
-  let startedAt = cached ? cached.value.startedAt : 0;
+  let startedAt = 0;
+  let anchor = 0;
+  let inspectedAt = cached ? Number(cached.inspectedAt) || 0 : 0;
 
   if (report.running) {
-    const stale = !startedAt || now - inspectedAt >= TURN_START_REFRESH_MS;
-    if (stale) {
+    // 只有上一次也是运行中，才沿用旧起点；否则视为新一轮，重新开始。
+    const sameRun = Boolean(cached && cached.value && cached.value.running === true);
+    startedAt = sameRun ? Number(cached.value.startedAt) || 0 : 0;
+    anchor = sameRun ? Number(cached.value.anchor) || 0 : 0;
+    if (!anchor) anchor = now;
+
+    if (!startedAt || now - inspectedAt >= TURN_START_REFRESH_MS) {
       try {
-        const inspection = await controller.inspect(sessionId);
-        startedAt = lastTurnStart(inspection && inspection.events);
-        inspectedAt = now;
-        report.source = 'inspect';
+        const fromEvents = await readTurnStartedAt(controller, sessionId);
+        if (fromEvents) {
+          startedAt = fromEvents;
+          report.source = 'events';
+        }
       } catch (error) {
         report.error = error instanceof Error ? error.message : String(error);
-        startedAt = 0;
       }
+      // 成功或失败都算检查过：失败时不再每 3 秒重试，起点交给下面的锚点。
+      inspectedAt = now;
     }
-    if (!startedAt) startedAt = now;
+
+    // 事件读不到时用锚点（本轮第一次观测到运行的时刻），保证只增不减、不跳表。
+    if (!startedAt) {
+      startedAt = anchor;
+      if (report.source !== 'events') report.source = 'observed';
+    }
     report.startedAt = startedAt;
+    report.anchor = anchor;
   }
 
   turnClockCache.set(sessionId, { at: now, value: report, inspectedAt });
@@ -1284,26 +1311,66 @@ function ensureCookieCleanupWatcher(enabled) {
 export function apply(ctx) {
   pluginContext = ctx;
   ctx.effect(() => () => { if (pluginContext === ctx) pluginContext = null; }, 'dsh-lqconfig: host context');
-  // 插件卸载时停掉内核，避免遗留孤儿进程
-  ctx.effect(() => () => { proxy.stopSync(); }, 'dsh-lqconfig: proxy cleanup');
+  // 插件卸载时停掉内核并还原系统代理，避免遗留孤儿进程 / 指向死端口的代理配置
+  ctx.effect(() => () => {
+    proxy.stopSync();
+    sysproxy.disableSystemProxySync();
+  }, 'dsh-lqconfig: proxy cleanup');
 
 
-  // 开关打开时，启动后自动预热内核；不阻塞 apply，失败只记日志
-  let warmupTimer = setTimeout(() => {
-    warmupTimer = null;
-    void proxy.readSettings()
-      .then(async (settings) => {
-        if (!settings.enabled || !settings.url) { await syncProxyEndpoint(); return undefined; }
-        const started = await proxy.ensure();
-        await syncProxyEndpoint();
-        return started;
+  // 开关打开时，启动后自动预热内核；延迟秒数走设置项 warmupSeconds（默认 8 秒），不阻塞 apply
+  let warmupTimer = null;
+  let warmupDisposed = false;
+  void proxy.readSettings()
+    .then((settings) => {
+      const sec = Number(settings.warmupSeconds);
+      return Number.isFinite(sec) ? Math.max(0, Math.min(600, sec)) * 1000 : WARMUP_DELAY_MS;
+    })
+    .catch(() => WARMUP_DELAY_MS)
+    .then((delayMs) => {
+      if (warmupDisposed) return;
+      warmupTimer = setTimeout(() => {
+        warmupTimer = null;
+        void proxy.readSettings()
+          .then(async (settings) => {
+            if (!settings.enabled || !settings.url) { await syncProxyEndpoint(); return undefined; }
+            const started = await proxy.ensure();
+            await syncProxyEndpoint();
+            // 内核起来后：打开系统代理开关 + 拉起看门狗（看门狗只负责「内核消失时还原」）
+            try {
+              await sysproxy.enableSystemProxy(settings.port);
+              await sysproxy.startWatchdog();
+            } catch (error) {
+              try { ctx.logger?.warn?.('[dsh-lqconfig] 系统代理开启失败：' + (error && error.message ? error.message : error)); } catch { /* 忽略 */ }
+            }
+            return started;
+          })
+          .catch((error) => {
+            void syncProxyEndpoint().catch(() => {});
+            try { ctx.logger?.warn?.('[dsh-lqconfig] 代理预热失败：' + (error && error.message ? error.message : error)); } catch { /* 忽略 */ }
+          });
+      }, delayMs);
+    });
+  ctx.effect(() => () => {
+    warmupDisposed = true;
+    if (warmupTimer !== null) { clearTimeout(warmupTimer); warmupTimer = null; }
+  }, 'dsh-lqconfig: proxy warmup');
+
+  // 定时刷新订阅：每 10 分钟检查一次，只有超过 refreshMinutes 才真正刷新并重启内核
+  // （看门狗有 8 秒宽限期，内核重启不会被误判成「死掉」）
+  const REFRESH_TICK_MS = 10 * 60 * 1000;
+  const refreshTimer = setInterval(() => {
+    void proxy.refreshIfExpired()
+      .then((result) => {
+        if (result && result.refreshed) {
+          try { ctx.logger?.info?.('[dsh-lqconfig] 订阅已自动刷新：' + result.node); } catch { /* 忽略 */ }
+        }
       })
       .catch((error) => {
-        void syncProxyEndpoint().catch(() => {});
-        try { ctx.logger?.warn?.('[dsh-lqconfig] 代理预热失败：' + (error && error.message ? error.message : error)); } catch { /* 忽略 */ }
+        try { ctx.logger?.warn?.('[dsh-lqconfig] 自动刷新失败：' + (error && error.message ? error.message : error)); } catch { /* 忽略 */ }
       });
-  }, WARMUP_DELAY_MS);
-  ctx.effect(() => () => { if (warmupTimer !== null) { clearTimeout(warmupTimer); warmupTimer = null; } }, 'dsh-lqconfig: proxy warmup');
+  }, REFRESH_TICK_MS);
+  ctx.effect(() => () => clearInterval(refreshTimer), 'dsh-lqconfig: provider auto-refresh');
 
   // 拉起“关闭后清理”守护进程；state.json 里 cookieAutoClean=false 可关闭
   ctx.effect(() => {
@@ -1319,7 +1386,10 @@ export function apply(ctx) {
   // 关窗口/退应用时即使插件 Dispose 没跑到，Node 退出也会同步收尾
   if (!exitHookInstalled) {
     exitHookInstalled = true;
-    process.on('exit', () => { try { proxy.stopSync(); } catch { /* 尽力而为 */ } });
+    process.on('exit', () => {
+      try { proxy.stopSync(); } catch { /* 尽力而为 */ }
+      try { sysproxy.disableSystemProxySync(); } catch { /* 尽力而为 */ }
+    });
   }
   ctx.effect(
     () =>
@@ -1451,6 +1521,10 @@ export function apply(ctx) {
                 return sendJson(res, 200, {
                   ok: true,
                   ...(await proxy.status()),
+                  systemProxy: sysproxy.getCachedSystemProxy(),
+                  warmupSeconds: settings.warmupSeconds,
+                  airports: proxy.airportList(),
+                  commonRegions: proxy.commonRegions(),
                   hasUrl: Boolean(settings.url),
                   host,
                   url: settings.url ? host + '（已保存）' : '',
@@ -1458,7 +1532,11 @@ export function apply(ctx) {
                 });
               }
               if (req.method === 'GET' && action === 'regions') {
-                return sendJson(res, 200, { ok: true, regions: await proxy.listRegions() });
+                return sendJson(res, 200, {
+                  ok: true,
+                  regions: await proxy.listRegions(),
+                  common: proxy.commonRegions(),
+                });
               }
               if (req.method === 'GET' && action === 'nodes') {
                 const settings = await proxy.readSettings();
@@ -1476,6 +1554,13 @@ export function apply(ctx) {
                 if (Array.isArray(body.regions)) patch.regions = body.regions;
                 if (typeof body.port === 'number') patch.port = body.port;
                 if (typeof body.refreshMinutes === 'number') patch.refreshMinutes = body.refreshMinutes;
+                if (typeof body.warmupSeconds === 'number') patch.warmupSeconds = body.warmupSeconds;
+                if (typeof body.airport === 'string') {
+                  if (!proxy.airportList().some((item) => item.id === body.airport)) {
+                    return sendJson(res, 400, { ok: false, error: '机场类型无效' });
+                  }
+                  patch.airport = body.airport;
+                }
                 const settings = await proxy.writeSettings(patch);
                 if (settings.enabled === false) await proxy.stop();
                 await syncProxyEndpoint();
@@ -1491,6 +1576,18 @@ export function apply(ctx) {
                 const stopped = await proxy.stop();
                 await syncProxyEndpoint();
                 return sendJson(res, 200, { ok: true, ...stopped });
+              }
+              if (req.method === 'GET' && action === 'system-proxy') {
+                return sendJson(res, 200, { ok: true, ...(await sysproxy.systemProxyStatus()) });
+              }
+              if (req.method === 'POST' && action === 'system-proxy') {
+                const body = await readBody(req);
+                if (body && body.enabled === true) {
+                  await sysproxy.enableSystemProxy();
+                } else {
+                  await sysproxy.disableSystemProxy();
+                }
+                return sendJson(res, 200, { ok: true, ...(await sysproxy.systemProxyStatus()) });
               }
               return sendJson(res, 404, { ok: false, error: 'not found' });
             }

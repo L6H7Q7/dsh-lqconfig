@@ -25,11 +25,41 @@ const DATA = path.join(HERE, 'proxy-data');
 const CONFIG = path.join(DATA, 'config.yaml');
 const PROVIDER = path.join(DATA, 'providers', 'zhuiyun.yaml');
 const PID_FILE = path.join(DATA, 'mihomo.pid');
+const GEO_DATA_SRC = path.join(HERE, 'bin', 'geoip.metadb');
+const GEO_DATA_DST = path.join(DATA, 'geoip.metadb');
 const LAST_PICK = path.join(DATA, 'last-pick.json');
 const SETTINGS = path.join(HERE, 'proxy.json');
 
 const UA = 'clash-verge/v2.5.5';
 const GROUP = '代理';
+
+/**
+ * 机场兼容块：新增机场只往这里加一项，解析/地区识别共用同一套引擎，
+ * 各机场独有的差异（过滤策略）写在各自的 profile 里。
+ *   zhuiyun —— 追云机场：yaml 块列表 - name: "新加坡 01【vip1】[A]"（原有行为，保持不变）
+ *   kunlun  —— 昆仑云机场：flow 单行 - { name: '🇯🇵KL·日本|东京03', server: ... }
+ */
+const AIRPORTS = {
+  zhuiyun: { label: '追云机场' },
+  kunlun: { label: '昆仑云机场' },
+};
+const AIRPORT_DEFAULT = 'zhuiyun';
+
+/** 地区词表：匹配时按长度倒序，保证「印度尼西亚」先于「印度」命中 */
+const REGION_WORDS = [
+  '日本', '新加坡', '香港', '台湾', '韩国', '美国', '英国', '德国', '法国',
+  '荷兰', '加拿大', '澳大利亚', '泰国', '越南', '马来西亚', '印度尼西亚', '菲律宾',
+  '印度', '俄罗斯', '土耳其', '阿联酋', '迪拜', '巴西', '阿根廷', '南非',
+  '意大利', '西班牙', '瑞士', '瑞典', '波兰', '乌克兰', '柬埔寨', '缅甸', '蒙古',
+  '哈萨克斯坦', '澳门',
+];
+const REGION_MATCH_ORDER = [...REGION_WORDS].sort((a, b) => b.length - a.length);
+
+/** 面板偏好按钮的固定地区清单（顺序即展示顺序） */
+const COMMON_REGION_ORDER = [
+  '香港', '澳门', '台湾', '新加坡', '日本', '美国', '英国', '韩国', '德国', '荷兰', '土耳其',
+];
+
 const DEFAULTS = {
   enabled: false,
   url: '',
@@ -38,6 +68,8 @@ const DEFAULTS = {
   apiPort: 9099,
   secret: 'dsh-lqconfig',
   refreshMinutes: 360,
+  airport: AIRPORT_DEFAULT,
+  warmupSeconds: 8,
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -56,6 +88,10 @@ function normalize(value) {
     secret: typeof input.secret === 'string' && input.secret ? input.secret : DEFAULTS.secret,
     refreshMinutes: Number.isInteger(input.refreshMinutes) && input.refreshMinutes > 0
       ? input.refreshMinutes : DEFAULTS.refreshMinutes,
+    airport: typeof input.airport === 'string' && AIRPORTS[input.airport]
+      ? input.airport : DEFAULTS.airport,
+    warmupSeconds: Number.isInteger(input.warmupSeconds) && input.warmupSeconds >= 0 && input.warmupSeconds <= 600
+      ? input.warmupSeconds : DEFAULTS.warmupSeconds,
   };
 }
 
@@ -129,14 +165,20 @@ function blockFromObject(item) {
   return lines;
 }
 
-/** 块里的 name，兼容 "  - name: x" 与 "    name: x" 两种首行 */
+/** 块里的 name，兼容三种写法：
+ *    "  - name: \"新加坡 01【vip1】[A]\""（yaml 块）
+ *    "    - { name: '🇯🇵KL·日本|东京03', server: ... }"（flow 单行，昆仑云）
+ *    "    - { name: 🇺🇸KL·美国|凤凰城1, ... }"（flow 无引号）
+ */
 function nameOfBlock(block) {
-  const hit = block.find((line) => /^\s*(?:-\s+)?name:\s*/.test(line));
+  const hit = block.find((line) => /name:\s*/.test(line));
   if (!hit) return '';
-  const quoted = hit.match(/name:\s*"([^"]*)"/);
-  if (quoted) return quoted[1].trim();
-  const plain = hit.match(/name:\s*([^"\n]+)/);
-  return plain ? plain[1].trim() : '';
+  const single = hit.match(/name:\s*'([^']*)'/);
+  if (single) return single[1].trim();
+  const double = hit.match(/name:\s*"([^"]*)"/);
+  if (double) return double[1].trim();
+  const plain = hit.match(/name:\s*([^,}\n]+)/);
+  return plain ? plain[1].trim().replace(/^['"]|['"]$/g, '') : '';
 }
 
 /** 返回 [{ name, lines }]，支持行内 JSON 数组和 yaml 块列表两种订阅格式 */
@@ -188,14 +230,32 @@ export function isInfoNode(name) {
   return /(剩余|到期|流量|套餐|重置|官网|防失联|客服|公告|邀请|购买)/.test(name);
 }
 
-/** 地区名：日本01【vip1】[A] → 日本；新加坡 03【vip1】 → 新加坡 */
+/**
+ * 地区名：优先按地区词表从整个名字里找（同时兼容
+ *   追云「日本02【vip1】[A]」与昆仑云「🇯🇵KL·日本|东京03」），
+ * 找不到才退回旧逻辑（去【】[]、取首段汉字）。
+ */
 export function regionOf(name) {
-  const cleaned = name
+  const text = String(name || '');
+  for (const word of REGION_MATCH_ORDER) {
+    if (text.includes(word)) return word;
+  }
+  const cleaned = text
     .replace(/【[^】]*】/g, '')
     .replace(/\[[^\]]*\]/g, '')
     .trim();
   const head = cleaned.split(/\s+/)[0] || cleaned;
   return head.replace(/\d+$/, '').replace(/[^\u4e00-\u9fa5A-Za-z]/g, '');
+}
+
+/** 面板偏好候选：固定常用地区清单，不依赖订阅内容（机场有就用，没有就跳过） */
+export function commonRegions() {
+  return [...COMMON_REGION_ORDER];
+}
+
+/** 面板「机场类型」下拉的数据源 */
+export function airportList() {
+  return Object.entries(AIRPORTS).map(([id, value]) => ({ id, label: value.label }));
 }
 
 async function writeProvider(entries) {
@@ -221,8 +281,15 @@ export async function refreshProvider(settings, force) {
     }
   }
   const text = await fetchSubscription(settings.url);
-  const entries = parseProxyEntries(text).filter((entry) => !isInfoNode(entry.name));
-  if (entries.length === 0) throw new Error('订阅里没解析出节点，链接可能失效');
+  let entries = parseProxyEntries(text).filter((entry) => !isInfoNode(entry.name));
+  // 昆仑云订阅里混着「📡 有异常请重启网络」这类没有地区名的提示节点：
+  // 偏好模式下永远选不到，只会污染节点列表，按机场类型滤掉。
+  if (settings.airport === 'kunlun') {
+    entries = entries.filter((entry) => regionOf(entry.name) !== '');
+  }
+  if (entries.length === 0) {
+    throw new Error('订阅里没解析出节点，链接可能失效（机场类型可能选错了，可在面板切换后重试）');
+  }
   await writeProvider(entries);
   return { refreshed: true, entries };
 }
@@ -271,6 +338,7 @@ function configYaml(settings) {
     '    type: select',
     '    use: [zhuiyun]',
     'rules:',
+    ...(existsSync(GEO_DATA_SRC) ? ['  - GEOIP,CN,DIRECT'] : []),
     '  - MATCH,' + GROUP,
     '',
   ].join('\n');
@@ -390,6 +458,7 @@ export async function status() {
     port: settings.port,
     proxy: 'http://127.0.0.1:' + settings.port,
     regions: settings.regions,
+    airport: settings.airport,
     refreshMinutes: settings.refreshMinutes,
     hasUrl: Boolean(settings.url),
     current,
@@ -438,6 +507,19 @@ async function triggerHealthCheck(settings) {
   } catch { /* 单点失败不影响后续读取 */ }
 }
 
+/** 把分组切到指定节点并记录，返回给调用方的简洁结果 */
+async function switchGroup(settings, best, region) {
+  const response = await api(settings, '/proxies/' + encodeURIComponent(GROUP), {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: best.name }),
+  });
+  if (!response.ok) throw new Error('切换节点失败：HTTP ' + response.status);
+  const picked = { region: region || '全部', node: best.name, delay: best.delay, at: Date.now() };
+  await writeLastPick(picked);
+  return { region: picked.region, node: picked.node, delay: picked.delay };
+}
+
 export async function pickAndSwitch(settingsOverride) {
   const settings = settingsOverride || await readSettings();
   const order = settings.regions.length > 0 ? settings.regions : [null];
@@ -461,24 +543,42 @@ export async function pickAndSwitch(settingsOverride) {
     const pool = region ? usable.filter((node) => regionOf(node.name) === region) : usable;
     if (pool.length === 0) continue;
     pool.sort((a, b) => a.delay - b.delay);
-    const best = pool[0];
-    const response = await api(settings, '/proxies/' + encodeURIComponent(GROUP), {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: best.name }),
-    });
-    if (!response.ok) throw new Error('切换节点失败：HTTP ' + response.status);
-    const picked = { region: region || '全部', node: best.name, delay: best.delay, at: Date.now() };
-    await writeLastPick(picked);
-    return { region: picked.region, node: picked.node, delay: picked.delay };
+    return await switchGroup(settings, pool[0], region);
   }
-  throw new Error('偏好地区内没有可用节点' + (settings.regions.length ? '（偏好：' + settings.regions.join('、') + '）' : ''));
+
+  // 偏好是软约束：机场里没有偏好地区（或全挂）时，回退到全部节点里挑最低延迟
+  if (settings.regions.length > 0) {
+    const pool = [...usable].sort((a, b) => a.delay - b.delay);
+    return await switchGroup(settings, pool[0], null);
+  }
+  throw new Error('健康检查后没有可用节点');
+}
+
+/** 把仓库里的 GeoIP 数据同步到内核工作目录（-d），GEOIP 规则才能生效 */
+async function ensureGeoData() {
+  try {
+    if (!existsSync(GEO_DATA_SRC)) return false;
+    let need = true;
+    try {
+      const srcStat = await fs.stat(GEO_DATA_SRC);
+      const dstStat = await fs.stat(GEO_DATA_DST);
+      need = dstStat.size !== srcStat.size;
+    } catch { need = true; }
+    if (need) {
+      await fs.mkdir(DATA, { recursive: true });
+      await fs.copyFile(GEO_DATA_SRC, GEO_DATA_DST);
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** force=true 时跳过 mtime 判断、立刻重拉订阅（面板「测试延迟并刷新节点」用）；默认惰性刷新。 */
 /** 拉起内核：先杀旧进程再启动，确保 config.yaml（含 dns 段）真正被加载 */
 async function startKernel(settings) {
   await killByPidFile();
+  await ensureGeoData();
   for (let i = 0; i < 25; i += 1) {
     if (!(await portOpen(settings.port)) && !(await portOpen(settings.apiPort))) break;
     await sleep(120);
@@ -499,6 +599,26 @@ async function startKernel(settings) {
   if (!ready) throw new Error('内核未在 10 秒内就绪');
 }
 
+/** 订阅文件已经多少分钟没更新了（不存在时返回 Infinity） */
+export async function providerAgeMinutes() {
+  try {
+    const stat = await fs.stat(PROVIDER);
+    return (Date.now() - stat.mtimeMs) / 60000;
+  } catch {
+    return Infinity;
+  }
+}
+
+/** 定时刷新用：只有订阅过期才刷新并重启内核，否则什么都不做 */
+export async function refreshIfExpired() {
+  const settings = await readSettings();
+  if (!settings.enabled || !settings.url) return { skipped: 'disabled' };
+  const age = await providerAgeMinutes();
+  if (age < settings.refreshMinutes) return { skipped: 'fresh', ageMinutes: Math.round(age) };
+  const ensured = await ensure(true);
+  return { refreshed: true, ...ensured };
+}
+
 export async function ensure(force = false) {
   const settings = await readSettings();
   if (!settings.enabled) throw new Error('代理开关未开启');
@@ -511,7 +631,8 @@ export async function ensure(force = false) {
   await fs.writeFile(CONFIG, configYaml(settings), 'utf8');
 
   const already = (await portOpen(settings.port)) && (await portOpen(settings.apiPort));
-  if (!already) await startKernel(settings);
+  // provider 文件被重写后内核不会自动重读，必须重启才能加载新节点；首次启动则直接拉起
+  if (!already || refreshed) await startKernel(settings);
 
   let picked;
   try {

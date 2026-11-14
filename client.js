@@ -96,8 +96,8 @@ window.__ModuleLoader__.load({
         () => balanceSnapshot,
       );
     }
-    /* ---------------- 觉醒模式徽标：左下角最上方，正常 / 进化 / 觉醒 三态 ---------------- */
-    let awakeningSnapshot = { loaded: false, awakening: false, variant: 'lite', error: '' };
+    /* ---------------- 提示词模式徽标：左下角最上方，正常 / 进化 / 觉醒 / 未注入 ---------------- */
+    let awakeningSnapshot = { loaded: false, awakening: false, rules: false, variant: 'lite', error: '' };
     const awakeningSubscribers = new Set();
     function publishAwakening(patch) {
       awakeningSnapshot = { ...awakeningSnapshot, ...patch };
@@ -117,6 +117,7 @@ window.__ModuleLoader__.load({
         publishAwakening({
           loaded: true,
           awakening: data.awakening === true,
+          rules: data.globalRules === true,
           variant: data.awakeningVariant === 'full' ? 'full' : 'lite',
           error: '',
         });
@@ -305,6 +306,18 @@ window.__ModuleLoader__.load({
       return Math.floor(hours / 24) + ' 天 ' + (hours % 24) + ' 小时';
     }
 
+    /* 颜色统一走宿主主题令牌，深浅色自动适配；令牌缺失时用与原样式接近的兜底值 */
+    const V = {
+      bd: 'var(--dsw-alias-border-l1, rgba(128,128,128,0.24))',
+      bd2: 'var(--dsw-alias-border-l2, rgba(128,128,128,0.38))',
+      fg2: 'var(--dsw-alias-label-secondary, rgba(128,128,128,0.95))',
+      brand: 'var(--dsw-alias-brand-primary, #2f6bff)',
+      ok: 'var(--dsw-alias-state-success-primary, #1e8449)',
+      err: 'var(--dsw-alias-state-error-primary, #c0392b)',
+      idle: 'var(--dsw-alias-state-idle-primary, rgba(128,128,128,0.55))',
+      bg2: 'var(--dsw-alias-bg-layer-2, rgba(128,128,128,0.08))',
+    };
+
     const S = {
       page: { padding: '8px 4px', fontSize: 14, lineHeight: 1.6 },
       card: { border: '1px solid rgba(128,128,128,0.28)', borderRadius: 12, padding: '16px 18px', marginBottom: 12 },
@@ -324,7 +337,7 @@ window.__ModuleLoader__.load({
         flexWrap: 'wrap',
       },
       btn: { border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', borderRadius: 8, padding: '5px 12px', fontSize: 13, cursor: 'pointer', color: 'inherit' },
-      primary: { background: '#1a1a1a', color: '#fff', borderColor: '#1a1a1a' },
+      primary: { background: V.brand, color: '#fff', borderColor: V.brand },
       note: { fontSize: 12, opacity: 0.65, marginTop: 10 },
       warn: { fontSize: 12, color: '#c0392b', marginTop: 10 },
       ok: { fontSize: 12, color: '#1e8449', marginTop: 10 },
@@ -336,6 +349,24 @@ window.__ModuleLoader__.load({
       chipX: { border: 'none', background: 'transparent', color: 'inherit', cursor: 'pointer', fontSize: 13, lineHeight: 1, padding: '2px 5px', opacity: 0.55, borderRadius: 5 },
       chipAdd: { width: 28, height: 26, borderRadius: 7, border: '1px dashed rgba(128,128,128,0.55)', background: 'transparent', color: 'inherit', cursor: 'pointer', fontSize: 15, lineHeight: 1, opacity: 0.75, padding: 0 },
       chipInput: { width: 76, height: 26, boxSizing: 'border-box', fontFamily: 'inherit', fontSize: 12, padding: '2px 8px', borderRadius: 7, border: '1px solid rgba(128,128,128,0.55)', background: 'transparent', color: 'inherit', outline: 'none' },
+      /* ---- 首页列表 + 二级页 ---- */
+      groupTitle: { fontSize: 11.5, fontWeight: 600, letterSpacing: 0.4, color: V.fg2, margin: '16px 0 8px', paddingLeft: 2 },
+      listGroup: { border: '1px solid ' + V.bd, borderRadius: 12, overflow: 'hidden' },
+      listRow: { display: 'flex', alignItems: 'center', gap: 10, minHeight: 46, padding: '6px 14px', cursor: 'pointer' },
+      rowName: { fontSize: 14, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+      rowChev: { fontSize: 12, lineHeight: 1, color: V.idle },
+      rowHint: { fontSize: 12, color: V.fg2, whiteSpace: 'nowrap' },
+      rowSpacer: { flex: '1 1 auto', minWidth: 6 },
+      detailHead: { display: 'flex', alignItems: 'center', margin: '0 0 8px' },
+      backBtn: { display: 'inline-flex', alignItems: 'center', border: 'none', background: 'transparent', color: V.fg2, fontSize: 13, padding: '6px 10px 6px 2px', borderRadius: 8, cursor: 'pointer', fontFamily: 'inherit' },
+      optionRow: { display: 'flex', gap: 11, padding: '12px 14px', borderTop: '1px solid ' + V.bd, cursor: 'pointer', alignItems: 'flex-start' },
+      optionRowOn: { background: V.bg2 },
+      radio: { width: 15, height: 15, borderRadius: 8, border: '1.5px solid ' + V.idle, flex: '0 0 auto', marginTop: 2, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' },
+      radioOn: { borderColor: V.brand },
+      radioDot: { width: 7, height: 7, borderRadius: 4, background: V.brand },
+      optName: { fontSize: 13.5, fontWeight: 500 },
+      optMeta: { fontSize: 11.5, color: V.fg2, marginTop: 3, lineHeight: 1.5 },
+      btnDanger: { border: '1px solid ' + V.err, background: 'transparent', color: V.err, borderRadius: 8, padding: '5px 12px', fontSize: 13, cursor: 'pointer', fontFamily: 'inherit' },
     };
 
     function Switch(props) {
@@ -351,7 +382,7 @@ window.__ModuleLoader__.load({
           'aria-label': props.label || '开关',
           style: { position: 'absolute', inset: 0, opacity: 0, margin: 0, zIndex: 1, cursor: disabled ? 'default' : 'pointer' },
         }),
-        el('span', { style: { position: 'absolute', inset: 0, borderRadius: 12, background: checked ? '#1a1a1a' : 'rgba(128,128,128,0.35)', transition: 'background .2s' } }),
+        el('span', { style: { position: 'absolute', inset: 0, borderRadius: 12, background: checked ? V.brand : 'rgba(128,128,128,0.35)', transition: 'background .2s', opacity: disabled ? 0.45 : 1 } }),
         el('span', { style: { position: 'absolute', top: 3, left: checked ? 23 : 3, width: 18, height: 18, borderRadius: 9, background: '#fff', boxShadow: '0 1px 2px rgba(0,0,0,.25)', transition: 'left .2s' } }));
     }
 
@@ -740,10 +771,13 @@ window.__ModuleLoader__.load({
     }
 
     function ProxyCard() {
-      const [state, setState] = useState({ hasUrl: false, enabled: false, running: false, current: '', version: '', port: 0, host: '' });
+      const [state, setState] = useState({ hasUrl: false, enabled: false, running: false, current: '', version: '', port: 0, host: '', airport: 'zhuiyun', airports: [], commonRegions: [] });
       const [urlInput, setUrlInput] = useState('');
+      const [airport, setAirport] = useState('zhuiyun');
+      const [airportBusy, setAirportBusy] = useState(false);
       const [portInput, setPortInput] = useState('');
       const [refreshInput, setRefreshInput] = useState('');
+      const [warmupInput, setWarmupInput] = useState('');
       const [regions, setRegions] = useState([]);
       const [available, setAvailable] = useState([]);
       const [busy, setBusy] = useState('');
@@ -771,8 +805,10 @@ window.__ModuleLoader__.load({
           const data = await call('/proxy/state');
           setState(data);
           setRegions(Array.isArray(data.regions) ? data.regions : []);
+          setAirport(data.airport || 'zhuiyun');
           setPortInput(data.port ? String(data.port) : '');
           setRefreshInput(data.refreshMinutes ? String(data.refreshMinutes) : '');
+          setWarmupInput(data.warmupSeconds !== undefined && data.warmupSeconds !== null ? String(data.warmupSeconds) : '');
         } catch (error) {
           setTone('warn');
           setMessage('读取失败：' + String(error && error.message ? error.message : error));
@@ -815,6 +851,42 @@ window.__ModuleLoader__.load({
           setMessage('保存链接失败：' + String(error && error.message ? error.message : error));
         }
         setBusy('');
+      }
+
+      async function saveAirport(next) {
+        if (next === airport) return;
+        setAirport(next);
+        setAirportBusy(true);
+        setMessage('');
+        try {
+          await call('/proxy/set', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ airport: next }),
+          });
+          if (!state.enabled) {
+            setTone('ok');
+            setMessage('机场类型已保存。代理开关未开，打开开关后点「测试延迟并刷新节点」生效。');
+            await load();
+            return;
+          }
+          setTone('note');
+          setMessage('机场类型已切换，正在刷新订阅并重选节点（约 10 秒）…');
+          const result = await call('/proxy/ensure', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ force: true }),
+          });
+          setTone('ok');
+          setMessage((result.refreshed ? '订阅已刷新 · ' : '') + '连通：' + result.region + ' / ' + result.node + '（' + result.delay + 'ms，共 ' + result.nodes + ' 个节点）');
+          await load();
+        } catch (error) {
+          setTone('warn');
+          setMessage('切换机场类型失败：' + String(error && error.message ? error.message : error));
+          await load();
+        } finally {
+          setAirportBusy(false);
+        }
       }
 
       async function toggle(next) {
@@ -861,14 +933,16 @@ window.__ModuleLoader__.load({
       async function saveTuning() {
         const port = Number(portInput);
         const refresh = Number(refreshInput);
+        const warmup = Number(warmupInput);
         if (!Number.isInteger(port) || port < 1 || port > 65535) { setTone('warn'); setMessage('端口需在 1–65535 之间'); return; }
         if (!Number.isInteger(refresh) || refresh < 1) { setTone('warn'); setMessage('订阅刷新需为正整数（分钟）'); return; }
+        if (!Number.isInteger(warmup) || warmup < 0 || warmup > 600) { setTone('warn'); setMessage('启动延迟需在 0–600 秒之间'); return; }
         setBusy('tuning');
         setMessage('');
         try {
-          await call('/proxy/set', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ port, refreshMinutes: refresh }) });
+          await call('/proxy/set', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ port, refreshMinutes: refresh, warmupSeconds: warmup }) });
           setTone('ok');
-          setMessage('已保存：端口 ' + port + '，订阅刷新 ' + refresh + ' 分钟');
+          setMessage('已保存：端口 ' + port + '，订阅刷新 ' + refresh + ' 分钟，启动延迟 ' + warmup + ' 秒');
           await load();
         } catch (error) {
           setTone('warn');
@@ -897,6 +971,11 @@ window.__ModuleLoader__.load({
         setBusy('');
       }
 
+      const preferenceRegions = Array.isArray(state.commonRegions) && state.commonRegions.length
+        ? state.commonRegions
+        : ['香港', '澳门', '台湾', '新加坡', '日本', '美国', '英国', '韩国', '德国', '荷兰', '土耳其'];
+      const airportLabel = ((state.airports || []).find((item) => item.id === state.airport) || {}).label || '';
+
       return el('div', { style: S.card },
         el('div', { style: S.head },
           el('div', { style: S.title }, '自动代理工具'),
@@ -917,6 +996,17 @@ window.__ModuleLoader__.load({
           }),
           el('button', { style: S.btn, onClick: () => { void saveUrl(); } }, '保存链接')),
         el('div', { style: { display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' } },
+          el('span', { style: { fontSize: 12, opacity: 0.7 } }, '机场类型'),
+          el('select', {
+            value: airport,
+            disabled: airportBusy || busy !== '',
+            onChange: (event) => { void saveAirport(event.target.value); },
+            style: { padding: '5px 8px', borderRadius: 8, border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: 13 },
+          }, ...(Array.isArray(state.airports) && state.airports.length
+            ? state.airports
+            : [{ id: 'zhuiyun', label: '追云机场' }]).map((item) => el('option', { key: item.id, value: item.id }, item.label))),
+          el('span', { style: S.note }, airportBusy ? '切换中…' : '切换后自动刷新订阅并重选节点；两种机场解析规则互不影响')),
+        el('div', { style: { display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' } },
           el('span', { style: { fontSize: 12, opacity: 0.7 } }, '端口'),
           el('input', {
             type: 'number', value: portInput, min: 1, max: 65535,
@@ -929,10 +1019,17 @@ window.__ModuleLoader__.load({
             onChange: (event) => setRefreshInput(event.target.value),
             style: { width: 80, padding: '5px 8px', borderRadius: 8, border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: 13 },
           }),
+          el('span', { style: { fontSize: 12, opacity: 0.7, marginLeft: 6 } }, '启动延迟（秒）'),
+          el('input', {
+            type: 'number', value: warmupInput, min: 0, max: 600,
+            onChange: (event) => setWarmupInput(event.target.value),
+            style: { width: 80, padding: '5px 8px', borderRadius: 8, border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: 13 },
+          }),
           el('button', { style: S.btn, onClick: () => { void saveTuning(); } }, '保存'),
-          el('span', { style: S.note }, '改端口要关开关重开才生效；刷新时间下次拉订阅时生效')),
+          el('span', { style: S.note }, '改端口要关开关重开才生效；启动延迟 = DSH 启动后多久拉起内核并开系统代理（下次重启生效）')),
         el('div', { style: S.status },
           '状态：' + (state.running ? '运行中' : '未运行')
+          + (airportLabel ? ' · ' + airportLabel : '')
           + (state.running && state.current ? ' · ' + state.current : '')
           + (state.delay ? ' · ' + state.delay + ' ms' : '')
           + (state.version ? ' · 内核 ' + state.version : '')
@@ -944,22 +1041,21 @@ window.__ModuleLoader__.load({
           + ' · 上次选节点：' + (state.lastPick ? timeAgo(state.lastPick.at) + '（' + state.lastPick.node + '）' : '无记录')),
         state.enabled ? el('div', { style: { marginTop: 14 } },
           el('div', { style: { fontSize: 13, fontWeight: 600 } }, '节点偏好（点击顺序即优先级）'),
-          el('div', { style: S.note }, '不选则全部节点挑最低延迟；选多个则依次尝试，前一个地区全挂才用下一个。地区来自订阅实际内容。'),
+          el('div', { style: S.note }, '常用地区清单固定，与机场无关：机场有该地区就用，没有就自动跳过；不选则全部节点挑最低延迟。'),
           el('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 } },
-            available.length === 0
-              ? el('span', { style: S.note }, '点「读取地区」从订阅取真实地区')
-              : available.map((item) => {
-                  const index = regions.indexOf(item.name);
-                  return el('button', {
-                    key: item.name,
-                    style: index >= 0 ? { ...S.btn, ...S.primary } : S.btn,
-                    onClick: () => toggleRegion(item.name),
-                  }, (index >= 0 ? (index + 1) + '. ' : '') + item.name + '（' + item.count + '）');
-                })),
+            preferenceRegions.map((name) => {
+              const index = regions.indexOf(name);
+              return el('button', {
+                key: name,
+                style: index >= 0 ? { ...S.btn, ...S.primary } : S.btn,
+                onClick: () => toggleRegion(name),
+              }, (index >= 0 ? (index + 1) + '. ' : '') + name);
+            })),
           el('div', { style: { display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' } },
             el('button', { style: S.btn, onClick: () => { void loadRegions(); } }, '读取地区'),
             el('button', { style: S.btn, onClick: () => { void saveRegions(); } }, '保存偏好'),
-            el('button', { style: S.btn, onClick: () => { void test(); } }, '测试延迟并刷新节点'))) : null,
+            el('button', { style: S.btn, onClick: () => { void test(); } }, '测试延迟并刷新节点')),
+          available.length > 0 ? el('div', { style: S.note }, '当前机场实际地区：' + available.map((item) => item.name + '（' + item.count + '）').join('、')) : null) : null,
         message ? el('div', { style: tone === 'warn' ? S.warn : tone === 'ok' ? S.ok : S.note }, message) : null,
         el('div', { style: S.mono }, '偏好：' + (regions.length ? regions.join(' → ') : '未设置（全部节点里选最低）')));
     }
@@ -1062,6 +1158,28 @@ window.__ModuleLoader__.load({
       const [extDraft, setExtDraft] = useState({ folder: '', program: '' });
       const extCancelRef = React.useRef(false);
 
+      /* ---- 列表 / 二级页 ---- */
+      const [detail, setDetail] = useState('');
+      const [promptSaving, setPromptSaving] = useState(false);
+      const [promptMessage, setPromptMessage] = useState('');
+      const [promptTone, setPromptTone] = useState('note');
+      const [cookie, setCookie] = useState(null);
+      const [listMessage, setListMessage] = useState('');
+
+      const proxyStore = useProxyStatus();
+      const balanceStore = useBalance();
+      useEffect(() => acquireProxyPolling(), []);
+
+      /* 二级页按 Esc 返回列表 */
+      useEffect(() => {
+        if (!detail) return undefined;
+        function onKey(event) {
+          if (event.key === 'Escape') { event.preventDefault(); setDetail(''); void load(); }
+        }
+        document.addEventListener('keydown', onKey, true);
+        return () => document.removeEventListener('keydown', onKey, true);
+      }, [detail]);
+
       function listOf(which) {
         return which === 'folder' ? (native.folderOnlyExts || []) : (native.programOnlyExts || []);
       }
@@ -1142,6 +1260,11 @@ window.__ModuleLoader__.load({
           setAwakeningChars(Number.isFinite(data.awakeningChars) ? data.awakeningChars : null);
           setAwakeningLiteChars(Number.isFinite(data.awakeningLiteChars) ? data.awakeningLiteChars : null);
           setPatchPath(data.patchPath || '');
+          setCookie({
+            enabled: data.cookieAutoClean !== false,
+            min: Number.isFinite(Number(data.cookieCleanMin)) ? Number(data.cookieCleanMin) : 30,
+            keep: Number.isFinite(Number(data.cookieKeep)) ? Number(data.cookieKeep) : 2,
+          });
           try {
             const infoRes = await fetch(API + '/global-rules', { cache: 'no-store' });
             const info = await infoRes.json();
@@ -1317,6 +1440,7 @@ window.__ModuleLoader__.load({
           setRules(Boolean(data.globalRules));
           setRulesMessage(data.changed ? '已重新注入三个预设，正在重启…' : '源文件未变，补丁已是最新。');
           setRulesTone(data.changed ? 'note' : 'ok');
+          void refreshAwakeningStatus();
           if (data.changed) {
             await restartAt('rules');
             return;
@@ -1329,11 +1453,124 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /* ---------- 提示词：全局规则与觉醒合并成一个三态菜单 ---------- */
+
+      function currentPromptMode() {
+        if (rules) return 'rules';
+        if (awakening) return awakeningVariant === 'full' ? 'full' : 'lite';
+        return 'off';
+      }
+
+      function promptLabel() {
+        const mode = currentPromptMode();
+        if (mode === 'rules') return '正常模式';
+        if (mode === 'full') return '觉醒 · 25 类';
+        if (mode === 'lite') return '进化 · 6 类';
+        return '未注入';
+      }
+
+      async function postJson(path, body) {
+        const res = await fetch(API + path, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!data || !data.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
+        return data;
+      }
+
+      /* 目标态：'off' | 'lite' | 'full' | 'rules'。先关掉冲突的那份，再开目标那份，只重启一次。 */
+      async function applyPrompt(target) {
+        if (promptSaving) return;
+        if (target === currentPromptMode()) return;
+        setPromptSaving(true);
+        setPromptMessage('');
+        setPromptTone('note');
+        let changed = false;
+        try {
+          if (rules && target !== 'rules') {
+            const r = await postJson('/global-rules', { enabled: false });
+            if (r.changed) changed = true;
+            setRules(Boolean(r.globalRules));
+          }
+          if (awakening && target !== 'lite' && target !== 'full') {
+            const a = await postJson('/awakening', { enabled: false });
+            if (a.changed) changed = true;
+            setAwakening(Boolean(a.awakening));
+          }
+          if (target === 'lite' || target === 'full') {
+            if (awakeningVariant !== target) {
+              const v = await postJson('/awakening-variant', { variant: target });
+              if (v.changed) changed = true;
+              setAwakeningVariant(v.awakeningVariant === 'full' ? 'full' : 'lite');
+            }
+            if (!awakening) {
+              const a = await postJson('/awakening', { enabled: true });
+              if (a.changed) changed = true;
+              setAwakening(Boolean(a.awakening));
+            }
+          }
+          if (target === 'rules' && !rules) {
+            const r = await postJson('/global-rules', { enabled: true });
+            if (r.changed) changed = true;
+            setRules(Boolean(r.globalRules));
+          }
+          if (changed) {
+            void refreshAwakeningStatus();
+            await restartAt('prompt');
+            return;
+          }
+          setPromptMessage('已是最新状态，无需重启。');
+          setPromptTone('ok');
+          void refreshAwakeningStatus();
+        } catch (error) {
+          setPromptMessage('切换失败：' + String(error && error.message ? error.message : error));
+          setPromptTone('warn');
+          await load();
+          void refreshAwakeningStatus();
+        }
+        setPromptSaving(false);
+      }
+
+      async function toggleProxy(next) {
+        setListMessage('');
+        try {
+          await postJson('/proxy/set', { enabled: next });
+          await refreshProxyStatus();
+        } catch (error) {
+          setListMessage('代理开关操作失败：' + String(error && error.message ? error.message : error));
+          await refreshProxyStatus();
+        }
+      }
+
+      async function saveCookieToggle(next) {
+        setListMessage('');
+        setCookie(current => (current ? { ...current, enabled: next } : { enabled: next, min: 30, keep: 2 }));
+        try {
+          const data = await postJson('/cookie-clean', { enabled: next });
+          setCookie({
+            enabled: data.cookieAutoClean !== false,
+            min: Number(data.cookieCleanMin),
+            keep: Number(data.cookieKeep),
+          });
+        } catch (error) {
+          setListMessage('Cookie 设置保存失败：' + String(error && error.message ? error.message : error));
+          await load();
+        }
+      }
+
       /** which: 'api' | 'rules' —— 重启状态显示在触发它的那张卡片上 */
       async function restartAt(which) {
-        const setS = which === 'awakening' ? setAwakeningSaving : which === 'rules' ? setRulesSaving : setSaving;
-        const setM = which === 'awakening' ? setAwakeningMessage : which === 'rules' ? setRulesMessage : setMessage;
-        const setT = which === 'awakening' ? setAwakeningTone : which === 'rules' ? setRulesTone : setTone;
+        const setS = which === 'awakening' ? setAwakeningSaving
+          : which === 'prompt' ? setPromptSaving
+            : which === 'rules' ? setRulesSaving : setSaving;
+        const setM = which === 'awakening' ? setAwakeningMessage
+          : which === 'prompt' ? setPromptMessage
+            : which === 'rules' ? setRulesMessage : setMessage;
+        const setT = which === 'awakening' ? setAwakeningTone
+          : which === 'prompt' ? setPromptTone
+            : which === 'rules' ? setRulesTone : setTone;
         setS(true);
         setM('正在重启，页面稍后会断开…');
         setT('note');
@@ -1346,61 +1583,215 @@ window.__ModuleLoader__.load({
         }
       }
 
-      return el('div', { style: S.page },
-        el('div', { style: S.card },
+      /* ---------- 首页列表 ---------- */
+
+      function proxyHint() {
+        const st = proxyStore.state || {};
+        if (st.running) return '运行中' + (st.delay ? ' · ' + st.delay + ' ms' : '');
+        if (st.enabled) return '已授权 · 未启动';
+        return '未启用';
+      }
+
+      function balanceHint() {
+        if (!balanceStore.enabled) return '已关闭';
+        const data = balanceStore.data;
+        return data && data.text ? String(data.text) : '等待刷新';
+      }
+
+      function row(index, opts) {
+        const clickable = Boolean(opts.target);
+        return el('div', {
+          key: opts.name,
+          role: clickable ? 'button' : undefined,
+          tabIndex: clickable ? 0 : undefined,
+          style: { ...S.listRow, borderTop: index ? '1px solid ' + V.bd : 'none' },
+          onClick: clickable ? () => setDetail(opts.target) : undefined,
+          onKeyDown: clickable ? event => {
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setDetail(opts.target); }
+          } : undefined,
+        },
+          el('span', { style: S.rowName }, opts.name),
+          clickable ? el('span', { style: S.rowChev }, '›') : null,
+          el('span', { style: S.rowSpacer }),
+          opts.hint ? el('span', { style: S.rowHint }, opts.hint) : null,
+          opts.onToggle
+            ? el('span', { style: { display: 'inline-flex' }, onClick: event => event.stopPropagation() },
+              el(Switch, {
+                checked: Boolean(opts.checked),
+                disabled: Boolean(opts.disabled),
+                label: opts.name,
+                onChange: event => {
+                  event.stopPropagation();
+                  opts.onToggle(event.target.checked);
+                },
+              }))
+            : null);
+      }
+
+      function group(items, index) {
+        return el('div', {
+          key: (items[0] && items[0].name) || 'group',
+          style: index ? { marginTop: 12 } : undefined,
+        },
+          el('div', { style: S.listGroup }, items.map((item, i) => row(i, item))));
+      }
+
+      function renderList() {
+        return el('div', { style: S.page },
+          group([
+            {
+              name: '系统提示词',
+              hint: promptLabel(),
+              checked: currentPromptMode() !== 'off',
+              disabled: promptSaving,
+              target: 'prompt',
+              onToggle: next => { void applyPrompt(next ? (awakeningVariant === 'full' ? 'full' : 'lite') : 'off'); },
+            },
+            {
+              name: '隐藏 API',
+              hint: hidden ? '已隐藏' : '显示中',
+              checked: hidden,
+              disabled: saving,
+              target: 'hidden',
+              onToggle: next => { setHidden(next); void persist(next); },
+            },
+          ], 0),
+          group([
+            {
+              name: '打开资源管理器和程序',
+              hint: (native.folderOnlyExts || []).length + ' + ' + (native.programOnlyExts || []).length + ' 个扩展名',
+              checked: native.openNative,
+              disabled: native.saving,
+              target: 'native',
+              onToggle: next => { void saveNativeSettings(next); },
+            },
+            {
+              name: '强制终止当前任务',
+              checked: forceStop.enabled,
+              target: 'force',
+              onToggle: next => {
+                setForceStopMessage('');
+                void saveForceStopSetting(next).then(problem => {
+                  setListMessage(problem ? '强制终止开关保存失败：' + problem : '');
+                });
+              },
+            },
+            {
+              name: '自动清理旧认证 Cookie',
+              hint: cookie ? '超 ' + cookie.min + ' 条保留 ' + cookie.keep : '',
+              checked: cookie ? cookie.enabled : false,
+              target: 'cookie',
+              onToggle: next => { void saveCookieToggle(next); },
+            },
+            {
+              name: '命令执行',
+              hint: '4 个开关',
+              target: 'shell',
+            },
+          ], 1),
+          group([
+            {
+              name: '代理',
+              hint: proxyHint(),
+              checked: Boolean(proxyStore.state && proxyStore.state.enabled),
+              target: 'proxy',
+              onToggle: next => { void toggleProxy(next); },
+            },
+            {
+              name: '余额显示',
+              hint: balanceHint(),
+              checked: Boolean(balanceStore.enabled),
+              target: 'balance',
+              onToggle: next => { void saveBalanceBadge(next); },
+            },
+          ], 2),
+          listMessage ? el('div', { style: S.warn }, listMessage) : null);
+      }
+
+      /* ---------- 二级页 ---------- */
+
+      function detailBack() {
+        return el('div', { style: S.detailHead },
+          el('button', {
+            type: 'button',
+            style: S.backBtn,
+            onClick: () => { setDetail(''); void load(); },
+          },
+            el('span', { style: { fontSize: 15, lineHeight: 1, marginRight: 5 } }, '‹'),
+            'LQ配置'));
+      }
+
+      function promptOption(mode, name, meta) {
+        const active = currentPromptMode() === mode;
+        return el('div', {
+          key: mode,
+          role: 'menuitemradio',
+          'aria-checked': active ? 'true' : 'false',
+          tabIndex: 0,
+          style: { ...S.optionRow, ...(active ? S.optionRowOn : {}) },
+          onClick: () => { void applyPrompt(mode); },
+          onKeyDown: event => {
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); void applyPrompt(mode); }
+          },
+        },
+          el('span', { style: { ...S.radio, ...(active ? S.radioOn : {}) } },
+            active ? el('span', { style: S.radioDot }) : null),
+          el('div', { style: { minWidth: 0 } },
+            el('div', { style: S.optName }, name),
+            el('div', { style: S.optMeta }, meta)));
+      }
+
+      function detailPromptCard() {
+        const mode = currentPromptMode();
+        return el('div', { style: S.card },
+          el('div', { style: S.head },
+            el('div', { style: S.title }, '系统提示词'),
+            el('span', { style: { fontSize: 12, color: V.fg2 } }, promptLabel())),
+          el('div', { style: S.desc }, '列表里的开关决定注不注入，这里决定注入哪份。内容写进三个 Agent 预设的 persona.prefix（系统提示前段），改完自动重启生效。'),
+          el('div', { style: { marginTop: 12, border: '1px solid ' + V.bd, borderRadius: 10, overflow: 'hidden' } },
+            promptOption('lite', '进化 · 6 类' + charsSuffix(awakeningLiteChars),
+              '精简版：保留游戏外挂与反作弊绕过、逆向与破解、成人内容与片源检索、提示词对抗研究、固件与硬件、盗版资源检索，其余 19 类删除。'),
+            promptOption('full', '觉醒 · 25 类' + charsSuffix(awakeningChars),
+              '完整版：25 类全部保留。'),
+            promptOption('rules', '正常模式' + (rulesInfo && rulesInfo.exists ? ' · ' + rulesInfo.injectedChars + ' 字符单行' : ''),
+              '全局规则版：GLOBAL-RULES.md 正文压成单行注入；关闭时只移除标记块，其余字符不动。')),
+          el('div', { style: S.status }, '当前：' + (mode === 'off' ? '未注入（已恢复预设原文）' : '已注入 3/3 个预设 · ' + promptLabel())
+            + (promptSaving ? ' · 处理中…' : '')),
+          promptMessage ? el('div', { style: promptTone === 'warn' ? S.warn : promptTone === 'ok' ? S.ok : S.note }, promptMessage) : null,
+          el('div', { style: { marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' } },
+            mode === 'rules'
+              ? el('button', { style: S.btn, disabled: rulesSaving, onClick: () => { void syncRules(); } }, '重新注入')
+              : null,
+            el('button', {
+              style: S.btn,
+              disabled: revealing !== '',
+              onClick: () => { void reveal(mode === 'rules' ? 'rules' : 'awakening'); },
+            }, revealing ? '打开中…' : '打开目录')),
+          rulesInfo && rulesInfo.truncated ? el('div', { style: S.warn }, '源文件超出单行注入上限，注入时已截断。') : null,
+          el('div', { style: S.mono }, '源：' + (mode === 'rules'
+            ? (rulesInfo && rulesInfo.path ? rulesInfo.path : '（未知）')
+            : (awakeningPath || '（未知）'))));
+      }
+
+      function detailHiddenCard() {
+        return el('div', { style: S.card },
           el('div', { style: S.head },
             el('div', { style: S.title }, '隐藏 API'),
-            el(Switch, { checked: hidden, disabled: saving, onChange: onToggle })),
+            el(Switch, { checked: hidden, disabled: saving, label: '隐藏 API', onChange: onToggle })),
           el('div', { style: S.desc }, '开启后，设置里的「DeepSeek」卡片和模型选择器里的「DeepSeek」分组都会消失；DeepSeek 账号通道不受影响。改动写进 profile 补丁，拨动开关即自动重启生效。'),
           el('div', { style: S.status }, '当前：' + (hidden ? '已隐藏' : '显示中') + (saving ? ' · 处理中…' : '')),
           message ? el('div', { style: tone === 'warn' ? S.warn : tone === 'ok' ? S.ok : S.note }, message) : null,
-          patchPath ? el('div', { style: S.mono }, '补丁：' + patchPath) : null),
-        el('div', { style: S.card },
-          el('div', { style: S.head },
-            el('div', { style: S.title }, '全局规则'),
-            el(Switch, { checked: rules, disabled: rulesSaving || awakening || awakeningSaving, label: '全局规则', onChange: onToggleRules })),
-          el('div', { style: S.desc }, '开启后，把插件目录 GLOBAL-RULES.md 的正文压成单行，注入三个 Agent 预设的 persona.prefix（系统提示前段）；关闭时只移除标记块，其余字符不动。改动写进 profile 补丁，拨动开关即自动重启生效；源文件改完点「重新注入」。'),
-          el('div', { style: S.status }, '当前：' + (rules ? '已注入 3/3 个预设' : '未注入') + (rulesSaving ? ' · 处理中…' : '')
-            + (rulesInfo && rulesInfo.exists
-              ? ' · 源 ' + rulesInfo.sourceBytes + ' 字节 / ' + rulesInfo.sourceLines + ' 行 → ' + rulesInfo.injectedChars + ' 字符单行'
-              : ' · 源文件缺失')),
-          rulesInfo && rulesInfo.truncated ? el('div', { style: S.warn }, '源文件超出单行注入上限，注入时已截断。') : null,
-          rulesMessage ? el('div', { style: rulesTone === 'warn' ? S.warn : rulesTone === 'ok' ? S.ok : S.note }, rulesMessage) : null,
-          el('div', { style: { marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            el('button', { style: S.btn, disabled: rulesSaving || !rules || awakening || awakeningSaving, onClick: () => { void syncRules(); } }, '重新注入'),
-            el('button', { style: S.btn, disabled: revealing === 'rules', onClick: () => { void reveal('rules'); } }, revealing === 'rules' ? '打开中…' : '打开目录')),
-          rulesInfo ? el('div', { style: S.mono }, '源：' + rulesInfo.path) : null),
-        el('div', { style: S.card },
-          el('div', { style: S.head },
-            el('div', { style: S.title }, '觉醒模式'),
-            el(Switch, { checked: awakening, disabled: awakeningSaving || rulesSaving, label: '觉醒模式',
-              onChange: event => { const next = event.target.checked; setAwakening(next); void persistAwakening(next); } })),
-          el('div', { style: S.desc }, '开启后，用所选版本的提示词正文替换三个 Agent 预设的 persona.prefix；关闭后从原文快照逐字恢复。保存后自动重启。开启期间暂时锁定「全局规则」，避免互相覆盖。改完提示词再拨一次开关（或重开）即可重新载入。'),
-          el('div', { style: S.status }, '当前：' + (awakening ? '已开启' : '未开启') + (awakeningSaving ? ' · 处理中…' : '')),
-          awakeningMessage ? el('div', { style: awakeningTone === 'warn' ? S.warn : awakeningTone === 'ok' ? S.ok : S.note }, awakeningMessage) : null,
-          el('div', { style: { marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
-            el('span', { style: { fontSize: 12, opacity: 0.65 } }, '提示词版本：'),
-            el('button', {
-              style: awakeningVariant === 'lite' ? { ...S.btn, ...S.primary } : S.btn,
-              disabled: variantSaving || awakeningSaving,
-              title: Number.isFinite(awakeningLiteChars) ? '精简版正文 ' + awakeningLiteChars + ' 字符' : '精简版正文大小未知',
-              onClick: () => { void persistAwakeningVariant('lite'); },
-            }, '精简 · 6 类' + charsSuffix(awakeningLiteChars)),
-            el('button', {
-              style: awakeningVariant === 'full' ? { ...S.btn, ...S.primary } : S.btn,
-              disabled: variantSaving || awakeningSaving,
-              title: Number.isFinite(awakeningChars) ? '完整版正文 ' + awakeningChars + ' 字符' : '完整版正文大小未知',
-              onClick: () => { void persistAwakeningVariant('full'); },
-            }, '完整 · 25 类' + charsSuffix(awakeningChars))),
-          el('div', { style: S.note }, '精简版保留：游戏外挂与反作弊绕过、逆向与破解、成人内容与片源检索、提示词对抗研究、固件与硬件、盗版资源检索，其余 19 类全部删除。觉醒已开启时切换版本会立即重写补丁并自动重启；未开启时只记配置，下次开启生效。'),
-          el('div', { style: { marginTop: 10, display: 'flex', gap: 8, flexWrap: 'wrap' } },
-            el('button', { style: S.btn, disabled: revealing === 'awakening', onClick: () => { void reveal('awakening'); } }, revealing === 'awakening' ? '打开中…' : '打开目录')),
-          el('div', { style: S.mono }, '源：' + (awakeningPath || '（未知）'))),
-        el('div', { style: S.card },
+          patchPath ? el('div', { style: S.mono }, '补丁：' + patchPath) : null);
+      }
+
+      function detailNativeCard() {
+        return el('div', { style: S.card },
           el('div', { style: S.head },
             el('div', { style: S.title }, '打开资源管理器和程序'),
-            el(Switch, { checked: native.openNative, disabled: native.saving, label: '打开资源管理器和程序',
-              onChange: event => { void saveNativeSettings(event.target.checked); } })),
+            el(Switch, {
+              checked: native.openNative, disabled: native.saving, label: '打开资源管理器和程序',
+              onChange: event => { void saveNativeSettings(event.target.checked); },
+            })),
           el('div', { style: S.desc }, '开启后，点击聊天里的本地绝对路径链接，会保留 Sidebar 原有预览，再按下面的名单请求系统打开该路径。行号链接、相对路径和网页链接保持原有行为。'),
           el('div', { style: S.desc }, '名单外的文件默认「程序打开 + 文件夹定位」两路都做；点「＋」把扩展名加进名单，就固定只走那一路。同一个扩展名只能出现在一边。'),
           renderExtRow('folder', '只开文件夹：'),
@@ -1417,8 +1808,11 @@ window.__ModuleLoader__.load({
             + ' · 保存即时生效'),
           native.message ? el('div', { style: S.note }, native.message) : null,
           native.error ? el('div', { style: S.warn }, native.error) : null,
-          native.compatibility ? el('div', { style: S.warn }, native.compatibility) : null),
-        el('div', { style: S.card },
+          native.compatibility ? el('div', { style: S.warn }, native.compatibility) : null);
+      }
+
+      function detailForceCard() {
+        return el('div', { style: S.card },
           el('div', { style: S.head },
             el('div', { style: S.title }, '强制终止当前任务'),
             el(Switch, {
@@ -1432,14 +1826,23 @@ window.__ModuleLoader__.load({
             })),
           el('div', { style: S.desc }, '开启后，对话输入框下方的状态栏多一条「运行时长 + 强制终止」：运行时长按本轮 turn 的真实起点计时（刷新页面不跳表）；点一下「强制终止」立即触发（没有二次确认，误点就会中断本轮并丢弃未完成的输出），会先发官方中止信号，再清理该会话的后台任务、终端进程和子代理，用来对付「暂停按了没反应」的卡住。点完若 8 秒内还在跑，状态栏会多出「仍在运行 · 重启 DSH」——那是最后兜底，单击即重启，会连同其它会话一起重启、页面断开几秒。关闭后这条状态栏完全不显示。'),
           el('div', { style: S.status }, '当前：' + (forceStop.enabled ? '已开启' : '未开启') + ' · 保存即时生效'),
-          forceStopMessage ? el('div', { style: S.note }, forceStopMessage) : null),
-        el(CookieCleanCard, {}),
-        el(VisibleShellCard, {}),
-        el(ProxyCard, {}),
-        el(BalanceCard, {}),
-        el('div', { style: S.card },
-          el('div', { style: S.title }, '说明'),
-          el('div', { style: S.desc }, '这是个人插件 dsh-lqconfig。每次改动都会先备份原补丁（.bak-lqconfig-时间戳）；「隐藏 API」与「全局规则」保存后仍按原逻辑自动重启；「打开资源管理器和程序」的开关与两个扩展名名单都只保存 state.json，立即生效，不触发重启。规则正文（含思维链那句）统一写在 GLOBAL-RULES.md，改完点「重新注入」。以后要加别的个人开关，往这里加卡片即可。')));
+          forceStopMessage ? el('div', { style: S.note }, forceStopMessage) : null);
+      }
+
+      function renderDetail() {
+        const body =
+          detail === 'prompt' ? detailPromptCard()
+            : detail === 'hidden' ? detailHiddenCard()
+              : detail === 'native' ? detailNativeCard()
+                : detail === 'force' ? detailForceCard()
+                  : detail === 'cookie' ? el(CookieCleanCard, {})
+                    : detail === 'shell' ? el(VisibleShellCard, {})
+                      : detail === 'proxy' ? el(ProxyCard, {})
+                        : detail === 'balance' ? el(BalanceCard, {}) : null;
+        return el('div', { style: S.page }, detailBack(), body);
+      }
+
+      return detail ? renderDetail() : renderList();
     }
 
     /**
@@ -1542,6 +1945,7 @@ window.__ModuleLoader__.load({
       const modeMenuRef = React.useRef(null);
       const [modeSaving, setModeSaving] = useState(false);
       const [balanceRefreshing, setBalanceRefreshing] = useState(false);
+      const [sysProxyBusy, setSysProxyBusy] = useState(false);
 
       // 菜单打开时：点外部或按 Esc 关闭（捕获阶段监听，避免被内部 stopPropagation 挡住）
       useEffect(() => {
@@ -1562,36 +1966,49 @@ window.__ModuleLoader__.load({
         };
       }, [modeMenu]);
 
+      async function postApi(path, body) {
+        const res = await fetch(API + path, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!data || !data.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
+        return data;
+      }
+
       /**
-       * 三模式切换（点击左下角觉醒行弹出的菜单）：
-       * normal = 关闭觉醒；lite = 开启 + 精简版；full = 开启 + 完整版。
-       * 先对齐版本再对齐开关，任一改动落地后统一重启一次。
+       * 提示词模式切换（点击左下角模式行弹出的菜单）：
+       * rules = 正常模式（注入全局规则版）；lite / full = 开启觉醒并用对应版本。
+       * 两种注入互斥：先关掉冲突的那份，再打开目标那份，改动落地后统一重启一次。
        */
-      async function applyAwakeningMode(mode) {
+      async function applyPromptMode(target) {
         if (modeSaving) return;
         setModeMenu(false);
-        const wantEnabled = mode !== 'normal';
-        const wantVariant = mode === 'full' ? 'full' : 'lite';
         setModeSaving(true);
         let needRestart = false;
         try {
-          if (wantEnabled && wantVariant !== awake.variant) {
-            const res = await fetch(API + '/awakening-variant', {
-              method: 'POST', headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ variant: wantVariant }),
-            });
-            const data = await res.json();
-            if (!data.ok) throw new Error(data.error || '切换版本失败');
-            if (data.changed) needRestart = true;
-          }
-          if (wantEnabled !== awake.awakening) {
-            const res = await fetch(API + '/awakening', {
-              method: 'POST', headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ enabled: wantEnabled }),
-            });
-            const data = await res.json();
-            if (!data.ok) throw new Error(data.error || '切换开关失败');
-            if (data.changed) needRestart = true;
+          if (target === 'rules') {
+            if (awake.awakening) {
+              const data = await postApi('/awakening', { enabled: false });
+              if (data.changed) needRestart = true;
+            }
+            if (!awake.rules) {
+              const data = await postApi('/global-rules', { enabled: true });
+              if (data.changed) needRestart = true;
+            }
+          } else {
+            if (awake.rules) {
+              const data = await postApi('/global-rules', { enabled: false });
+              if (data.changed) needRestart = true;
+            }
+            if (awake.variant !== target) {
+              const data = await postApi('/awakening-variant', { variant: target });
+              if (data.changed) needRestart = true;
+            }
+            if (!awake.awakening) {
+              const data = await postApi('/awakening', { enabled: true });
+              if (data.changed) needRestart = true;
+            }
           }
           if (needRestart) {
             await refreshAwakeningStatus();
@@ -1622,26 +2039,49 @@ window.__ModuleLoader__.load({
         return acquireBalancePolling();
       }, [balance.enabled]);
 
-      // 三态：觉醒关闭=正常模式；开启+精简=进化模式；开启+完整=觉醒模式
+      // 与设置页「系统提示词」一一对应：全局规则=正常模式；觉醒+精简=进化模式；觉醒+完整=觉醒模式；都没有=未注入
       const aMode = awake.error ? '状态未知'
         : !awake.loaded ? '读取中…'
-          : !awake.awakening ? '正常模式'
-            : awake.variant === 'full' ? '觉醒模式' : '进化模式';
+          : awake.awakening ? (awake.variant === 'full' ? '觉醒模式' : '进化模式')
+            : awake.rules ? '正常模式' : '未注入';
       const aColor = awake.error ? '#c0392b'
         : !awake.loaded ? 'rgba(128,128,128,0.6)'
-          : !awake.awakening ? 'rgba(128,128,128,0.6)'
-            : awake.variant === 'full' ? '#8e44ad' : '#c28b30';
-      const aHalo = awake.awakening && !awake.error
-        ? (awake.variant === 'full' ? '0 0 0 3px rgba(142,68,173,0.16)' : '0 0 0 3px rgba(194,139,48,0.16)')
-        : 'none';
-      const aDetail = '觉醒模式：' + aMode
+          : awake.awakening ? (awake.variant === 'full' ? '#8e44ad' : '#c28b30')
+            : awake.rules ? '#1e8449' : 'rgba(128,128,128,0.45)';
+      const aHalo = awake.error || !awake.loaded ? 'none'
+        : awake.awakening ? (awake.variant === 'full' ? '0 0 0 3px rgba(142,68,173,0.16)' : '0 0 0 3px rgba(194,139,48,0.16)')
+          : awake.rules ? '0 0 0 3px rgba(30,132,73,0.16)' : 'none';
+      const aDetail = '提示词模式：' + aMode
         + (awake.error ? '（' + awake.error + '）'
-          : awake.awakening ? (awake.variant === 'full' ? '（提示词完整版 25 类）' : '（提示词精简版 6 类）')
-            : '（未注入提示词，用原生人格）');
+          : !awake.loaded ? ''
+            : awake.awakening ? (awake.variant === 'full' ? '（注入完整版 25 类）' : '（注入精简版 6 类）')
+              : awake.rules ? '（注入全局规则版 GLOBAL-RULES.md）'
+                : '（未注入，用预设原生人格）');
 
       const running = Boolean(state && state.running);
       const enabled = Boolean(state && state.enabled);
       const color = store.error ? '#c0392b' : running ? '#1e8449' : enabled ? '#c28b30' : 'rgba(128,128,128,0.6)';
+      // ---- 系统代理开关（左下角节点右侧按钮）：只切系统代理，不动内核，可秒开秒关 ----
+      const sysProxyState = state && state.systemProxy ? state.systemProxy : null;
+      const sysProxyKnown = Boolean(sysProxyState && typeof sysProxyState.enabled === 'boolean');
+      const sysProxyOn = Boolean(sysProxyKnown && sysProxyState.enabled === true);
+      const sysLabel = !sysProxyKnown ? '…' : sysProxyOn ? '运行中' : '已关闭';
+      async function toggleSysProxy() {
+        if (sysProxyBusy) return;
+        setSysProxyBusy(true);
+        try {
+          const res = await fetch(API + '/proxy/system-proxy', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ enabled: !sysProxyOn }),
+          });
+          const data = await res.json();
+          if (!data || !data.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
+          await refreshProxyStatus();
+        } catch (error) {
+          publishProxy({ error: String(error && error.message ? error.message : error) });
+        }
+        setSysProxyBusy(false);
+      }
       const label = store.error ? '代理状态未知'
         : !state ? '读取中…'
           : running ? (state.current || '代理运行中')
@@ -1704,15 +2144,17 @@ window.__ModuleLoader__.load({
               boxShadow: '0 8px 24px rgba(0,0,0,0.22)',
             },
           },
-            [['normal', '正常模式', '关闭提示词注入'], ['lite', '进化模式', '开启 · 精简 6 类'], ['full', '觉醒模式', '开启 · 完整 25 类']].map(([mode, name, hint]) => {
-              const current = mode === 'normal' ? !awake.awakening : (awake.awakening && awake.variant === mode);
+            [['rules', '正常模式', '注入全局规则版'], ['lite', '进化模式', '注入 · 精简 6 类'], ['full', '觉醒模式', '注入 · 完整 25 类']].map(([mode, name, hint]) => {
+              const current = mode === 'rules'
+                ? !awake.awakening && awake.rules
+                : awake.awakening && awake.variant === mode;
               return el('button', {
                 key: mode,
                 type: 'button',
                 role: 'menuitemradio',
                 'aria-checked': current ? 'true' : 'false',
                 disabled: modeSaving,
-                onClick: (event) => { event.stopPropagation(); void applyAwakeningMode(mode); },
+                onClick: (event) => { event.stopPropagation(); void applyPromptMode(mode); },
                 style: {
                   display: 'flex', alignItems: 'center', gap: 8, width: '100%',
                   padding: '6px 8px', margin: 0, background: current ? 'rgba(128,128,128,0.20)' : 'transparent',
@@ -1749,33 +2191,54 @@ window.__ModuleLoader__.load({
           wide ? el('span', {
             style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.85 },
           }, balanceRefreshing ? '刷新中…' : bLabel) : null) : null,
-        el('button', {
-          type: 'button',
-          title: detail + '，点击查看详情',
-          'aria-expanded': store.popover ? 'true' : 'false',
-          onClick: (event) => {
-            event.stopPropagation();
-            void refreshProxyStatus();
-            publishProxy({ popover: !proxySnapshot.popover, message: '', tone: 'note' });
-          },
-          style: {
-            display: 'flex', alignItems: 'center', gap: 8, flex: '1 1 auto',
-            minWidth: 0, width: wide ? '100%' : 'auto', padding: wide ? '6px 10px' : '6px', margin: 0,
-            background: 'transparent', border: 'none', borderRadius: 8, cursor: 'pointer',
-            color: 'inherit', fontSize: 12, textAlign: 'left', justifyContent: wide ? 'flex-start' : 'center',
-          },
+        el('div', {
+          style: { display: 'flex', alignItems: 'center', gap: 4, minWidth: 0, width: wide ? '100%' : 'auto' },
         },
-          el('span', {
-            'aria-hidden': 'true',
-            style: {
-              width: 8, height: 8, flex: '0 0 auto', borderRadius: 4, background: color,
-              boxShadow: running ? '0 0 0 3px rgba(30,132,73,0.16)' : 'none',
-              transition: 'background .2s',
+          el('button', {
+            type: 'button',
+            title: detail + '，点击查看详情',
+            'aria-expanded': store.popover ? 'true' : 'false',
+            onClick: (event) => {
+              event.stopPropagation();
+              void refreshProxyStatus();
+              publishProxy({ popover: !proxySnapshot.popover, message: '', tone: 'note' });
             },
-          }),
-          wide ? el('span', {
-            style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.85 },
-          }, label) : null));
+            style: {
+              display: 'flex', alignItems: 'center', gap: 8, flex: '1 1 auto',
+              minWidth: 0, width: wide ? '100%' : 'auto', padding: wide ? '6px 10px' : '6px', margin: 0,
+              background: 'transparent', border: 'none', borderRadius: 8, cursor: 'pointer',
+              color: 'inherit', fontSize: 12, textAlign: 'left', justifyContent: wide ? 'flex-start' : 'center',
+            },
+          },
+            el('span', {
+              'aria-hidden': 'true',
+              style: {
+                width: 8, height: 8, flex: '0 0 auto', borderRadius: 4, background: color,
+                boxShadow: running ? '0 0 0 3px rgba(30,132,73,0.16)' : 'none',
+                transition: 'background .2s',
+              },
+            }),
+            wide ? el('span', {
+              style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.85 },
+            }, label) : null),
+          el('button', {
+            type: 'button',
+            title: sysProxyKnown
+              ? (sysProxyOn ? '系统代理运行中。点击关闭（内核不停，可秒切）' : '系统代理已关闭。点击重新开启')
+              : '系统代理状态读取中…',
+            'aria-label': '系统代理：' + sysLabel,
+            onClick: (event) => { event.stopPropagation(); void toggleSysProxy(); },
+            disabled: sysProxyBusy,
+            style: {
+              flex: '0 0 auto', padding: '2px 8px', margin: 0, borderRadius: 999,
+              border: '1px solid ' + (sysProxyOn ? 'rgba(30,132,73,0.38)' : 'rgba(128,128,128,0.35)'),
+              background: sysProxyOn ? 'rgba(30,132,73,0.12)' : 'transparent',
+              color: sysProxyOn ? '#1e8449' : 'rgba(128,128,128,0.9)',
+              fontSize: 11, lineHeight: '16px',
+              cursor: sysProxyBusy ? 'default' : 'pointer',
+              whiteSpace: 'nowrap', fontFamily: 'inherit',
+            },
+          }, sysProxyBusy ? '切换中…' : sysLabel)));
     }
 
     /** 徽标弹层：状态明细 + 测试延迟并刷新节点 / 停止内核；渲染在 shell.overlay 里 */
@@ -1940,7 +2403,16 @@ window.__ModuleLoader__.load({
             const data = await response.json();
             if (!alive || !data || !data.ok) return;
             const next = { running: data.running === true, startedAt: Number(data.startedAt) || 0 };
-            setClock(current => (current.running === next.running && current.startedAt === next.startedAt ? current : next));
+            setClock(current => {
+              // 服务端若把起点重锚到「稍晚」的时刻（读不到真实起点时的兜底），
+              // 保持已显示的起点，避免计时跳回 0；确实换了一轮（差得远）才接受。
+              if (next.running && current.running && next.startedAt && current.startedAt
+                && next.startedAt > current.startedAt
+                && next.startedAt - current.startedAt < 10000) {
+                return current;
+              }
+              return current.running === next.running && current.startedAt === next.startedAt ? current : next;
+            });
             if (next.running) {
               setNow(Date.now());
             } else {
