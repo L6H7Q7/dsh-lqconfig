@@ -96,6 +96,32 @@ export async function syncProxyEndpoint() {
   return record;
 }
 
+const YT_DELAY_TARGET = 'https://www.youtube.com/generate_204';
+const YT_DELAY_CACHE_MS = 3000;
+let ytDelayCache = { at: 0, data: null };
+
+/** 测当前节点访问 YouTube 的真实耗时（毫秒）；带 3 秒缓存，force 时重新测 */
+async function measureYtDelay(force) {
+  if (!force && ytDelayCache.data && Date.now() - ytDelayCache.at < YT_DELAY_CACHE_MS) {
+    return ytDelayCache.data;
+  }
+  const settings = await proxy.readSettings();
+  const status = await proxy.status();
+  if (!status.running) {
+    const data = { running: false, ok: false, delay: null, at: Date.now() };
+    ytDelayCache = { at: Date.now(), data };
+    return data;
+  }
+  const started = Date.now();
+  let code = 0;
+  try { code = await proxy.probeThroughProxy(settings.port, YT_DELAY_TARGET, 8000); } catch { code = 0; }
+  const elapsed = Date.now() - started;
+  const ok = code >= 200 && code < 400;
+  const data = { running: true, ok, delay: ok ? elapsed : null, at: Date.now() };
+  ytDelayCache = { at: Date.now(), data };
+  return data;
+}
+
 function exePath() {
   return process.env.DSH_DESKTOP_EXE || 'D:\\AI\\Agent\\DeepSeek Harness\\DeepSeek Harness.exe';
 }
@@ -1545,6 +1571,10 @@ export function apply(ctx) {
                   ok: true,
                   nodes: entries.map((entry) => ({ name: entry.name, region: proxy.regionOf(entry.name) })),
                 });
+              }
+              if (req.method === 'GET' && action === 'yt-delay') {
+                const force = url.searchParams.get('force') === '1';
+                return sendJson(res, 200, { ok: true, ...(await measureYtDelay(force)) });
               }
               if (req.method === 'POST' && action === 'set') {
                 const body = await readBody(req);

@@ -771,10 +771,8 @@ window.__ModuleLoader__.load({
     }
 
     function ProxyCard() {
-      const [state, setState] = useState({ hasUrl: false, enabled: false, running: false, current: '', version: '', port: 0, host: '', airport: 'zhuiyun', airports: [], commonRegions: [] });
+      const [state, setState] = useState({ hasUrl: false, enabled: false, running: false, current: '', version: '', port: 0, host: '', commonRegions: [] });
       const [urlInput, setUrlInput] = useState('');
-      const [airport, setAirport] = useState('zhuiyun');
-      const [airportBusy, setAirportBusy] = useState(false);
       const [portInput, setPortInput] = useState('');
       const [refreshInput, setRefreshInput] = useState('');
       const [warmupInput, setWarmupInput] = useState('');
@@ -805,7 +803,6 @@ window.__ModuleLoader__.load({
           const data = await call('/proxy/state');
           setState(data);
           setRegions(Array.isArray(data.regions) ? data.regions : []);
-          setAirport(data.airport || 'zhuiyun');
           setPortInput(data.port ? String(data.port) : '');
           setRefreshInput(data.refreshMinutes ? String(data.refreshMinutes) : '');
           setWarmupInput(data.warmupSeconds !== undefined && data.warmupSeconds !== null ? String(data.warmupSeconds) : '');
@@ -851,42 +848,6 @@ window.__ModuleLoader__.load({
           setMessage('保存链接失败：' + String(error && error.message ? error.message : error));
         }
         setBusy('');
-      }
-
-      async function saveAirport(next) {
-        if (next === airport) return;
-        setAirport(next);
-        setAirportBusy(true);
-        setMessage('');
-        try {
-          await call('/proxy/set', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ airport: next }),
-          });
-          if (!state.enabled) {
-            setTone('ok');
-            setMessage('机场类型已保存。代理开关未开，打开开关后点「测试延迟并刷新节点」生效。');
-            await load();
-            return;
-          }
-          setTone('note');
-          setMessage('机场类型已切换，正在刷新订阅并重选节点（约 10 秒）…');
-          const result = await call('/proxy/ensure', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ force: true }),
-          });
-          setTone('ok');
-          setMessage((result.refreshed ? '订阅已刷新 · ' : '') + '连通：' + result.region + ' / ' + result.node + '（' + result.delay + 'ms，共 ' + result.nodes + ' 个节点）');
-          await load();
-        } catch (error) {
-          setTone('warn');
-          setMessage('切换机场类型失败：' + String(error && error.message ? error.message : error));
-          await load();
-        } finally {
-          setAirportBusy(false);
-        }
       }
 
       async function toggle(next) {
@@ -961,7 +922,7 @@ window.__ModuleLoader__.load({
             body: JSON.stringify({ force: true }),
           });
           setTone('ok');
-          setMessage((result.refreshed ? '订阅已刷新 · ' : '') + '连通：' + result.region + ' / ' + result.node + '（' + result.delay + 'ms，共 ' + result.nodes + ' 个节点）');
+          setMessage((result.refreshed ? '订阅已刷新 · ' : '') + '连通：' + result.region + ' / ' + result.node + '（' + result.delay + 'ms，共 ' + result.nodes + ' 个节点）' + (result.verified ? ' · YouTube 已验证' : '') + (result.verifyFallback ? '（真实站验证均未通过，已按延迟回退）' : ''));
           await load();
         } catch (error) {
           setTone('warn');
@@ -974,7 +935,7 @@ window.__ModuleLoader__.load({
       const preferenceRegions = Array.isArray(state.commonRegions) && state.commonRegions.length
         ? state.commonRegions
         : ['香港', '澳门', '台湾', '新加坡', '日本', '美国', '英国', '韩国', '德国', '荷兰', '土耳其'];
-      const airportLabel = ((state.airports || []).find((item) => item.id === state.airport) || {}).label || '';
+      const airportLabel = '自动（YouTube 验证）';
 
       return el('div', { style: S.card },
         el('div', { style: S.head },
@@ -995,17 +956,6 @@ window.__ModuleLoader__.load({
             style: { flex: 1, minWidth: 0, padding: '6px 10px', borderRadius: 8, border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: 13 },
           }),
           el('button', { style: S.btn, onClick: () => { void saveUrl(); } }, '保存链接')),
-        el('div', { style: { display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' } },
-          el('span', { style: { fontSize: 12, opacity: 0.7 } }, '机场类型'),
-          el('select', {
-            value: airport,
-            disabled: airportBusy || busy !== '',
-            onChange: (event) => { void saveAirport(event.target.value); },
-            style: { padding: '5px 8px', borderRadius: 8, border: '1px solid rgba(128,128,128,0.35)', background: 'transparent', color: 'inherit', fontSize: 13 },
-          }, ...(Array.isArray(state.airports) && state.airports.length
-            ? state.airports
-            : [{ id: 'zhuiyun', label: '追云机场' }]).map((item) => el('option', { key: item.id, value: item.id }, item.label))),
-          el('span', { style: S.note }, airportBusy ? '切换中…' : '切换后自动刷新订阅并重选节点；两种机场解析规则互不影响')),
         el('div', { style: { display: 'flex', gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' } },
           el('span', { style: { fontSize: 12, opacity: 0.7 } }, '端口'),
           el('input', {
@@ -1038,7 +988,7 @@ window.__ModuleLoader__.load({
           + (busy ? ' · 处理中…' : '')),
         el('div', { style: S.mono },
           '订阅更新：' + (state.providerUpdatedAt ? timeAgo(state.providerUpdatedAt) : '未拉取')
-          + ' · 上次选节点：' + (state.lastPick ? timeAgo(state.lastPick.at) + '（' + state.lastPick.node + '）' : '无记录')),
+          + ' · 上次选节点：' + (state.lastPick ? timeAgo(state.lastPick.at) + '（' + state.lastPick.node + (state.lastPick.verified ? ' · YouTube 已验证' : '') + '）' : '无记录')),
         state.enabled ? el('div', { style: { marginTop: 14 } },
           el('div', { style: { fontSize: 13, fontWeight: 600 } }, '节点偏好（点击顺序即优先级）'),
           el('div', { style: S.note }, '常用地区清单固定，与机场无关：机场有该地区就用，没有就自动跳过；不选则全部节点挑最低延迟。'),
@@ -1946,6 +1896,53 @@ window.__ModuleLoader__.load({
       const [modeSaving, setModeSaving] = useState(false);
       const [balanceRefreshing, setBalanceRefreshing] = useState(false);
       const [sysProxyBusy, setSysProxyBusy] = useState(false);
+      const [ytDelay, setYtDelay] = useState({ loading: true, running: false, ok: false, delay: null });
+      // YouTube 延迟：参考余额的刷新模式——定时轮询、窗口可见时立即刷新、点击立即测
+      async function refreshYtDelay(force) {
+        try {
+          const res = await fetch(API + '/proxy/yt-delay' + (force ? '?force=1' : ''), { cache: 'no-store' });
+          const data = await res.json();
+          if (!data.ok) throw new Error(data.error || ('HTTP ' + res.status));
+          const patch = {
+            loading: false,
+            running: Boolean(data.running),
+            ok: Boolean(data.ok && data.running && typeof data.delay === 'number' && data.delay > 0),
+            delay: typeof data.delay === 'number' && data.delay > 0 ? data.delay : null,
+          };
+          setYtDelay(patch);
+          return patch;
+        } catch {
+          const patch = { loading: false, running: false, ok: false, delay: null };
+          setYtDelay(patch);
+          return patch;
+        }
+      }
+      useEffect(() => {
+        let retryTimer = null;
+        let tries = 0;
+        // 启动时内核可能还在预热：未运行则每 4 秒补测一次（最多 5 次），之后进入常规轮询
+        async function start() {
+          const data = await refreshYtDelay();
+          if (data && !data.running && tries < 5) {
+            tries += 1;
+            retryTimer = setTimeout(() => { void start(); }, 4000);
+          }
+        }
+        void start();
+        const timer = setInterval(() => {
+          if (typeof document !== 'undefined' && document.hidden) return;
+          void refreshYtDelay();
+        }, 15000);
+        function onVisibility() {
+          if (typeof document !== 'undefined' && !document.hidden) void refreshYtDelay(true);
+        }
+        if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility);
+        return () => {
+          clearInterval(timer);
+          if (retryTimer !== null) clearTimeout(retryTimer);
+          if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility);
+        };
+      }, []);
 
       // 菜单打开时：点外部或按 Esc 关闭（捕获阶段监听，避免被内部 stopPropagation 挡住）
       useEffect(() => {
@@ -2087,6 +2084,15 @@ window.__ModuleLoader__.load({
           : running ? (state.current || '代理运行中')
             : enabled ? '内核未启动'
               : '代理已关闭';
+      const ytLabel = ytDelay.loading ? '…'
+        : !ytDelay.running ? '—'
+          : ytDelay.ok && ytDelay.delay ? ytDelay.delay + 'ms'
+            : '网络错误';
+      // 延迟分级：≤150ms 绿、≤300ms 黄、更慢或失败 红
+      const ytColor = ytDelay.loading || !ytDelay.running ? 'rgba(128,128,128,0.6)'
+        : ytDelay.ok && ytDelay.delay
+          ? (ytDelay.delay <= 150 ? '#1e8449' : ytDelay.delay <= 300 ? '#c28b30' : '#c0392b')
+          : '#c0392b';
       const detail = '代理：' + label
         + (state && state.delay ? '（' + state.delay + 'ms）' : '')
         + (state && state.port ? '（端口 ' + state.port + '）' : '');
@@ -2204,8 +2210,8 @@ window.__ModuleLoader__.load({
               publishProxy({ popover: !proxySnapshot.popover, message: '', tone: 'note' });
             },
             style: {
-              display: 'flex', alignItems: 'center', gap: 8, flex: '1 1 auto',
-              minWidth: 0, width: wide ? '100%' : 'auto', padding: wide ? '6px 10px' : '6px', margin: 0,
+              display: 'flex', alignItems: 'center', gap: 8, flex: '0 1 auto',
+              minWidth: 0, padding: wide ? '6px 10px' : '6px', margin: 0,
               background: 'transparent', border: 'none', borderRadius: 8, cursor: 'pointer',
               color: 'inherit', fontSize: 12, textAlign: 'left', justifyContent: wide ? 'flex-start' : 'center',
             },
@@ -2221,6 +2227,16 @@ window.__ModuleLoader__.load({
             wide ? el('span', {
               style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', opacity: 0.85 },
             }, label) : null),
+          wide ? el('button', {
+            type: 'button',
+            title: '对 YouTube 的延迟（点击立即测量）',
+            onClick: (event) => { event.stopPropagation(); void refreshYtDelay(true); },
+            style: {
+              flex: '1 1 auto', padding: '2px 6px', margin: 0, borderRadius: 999, border: 'none',
+              background: 'transparent', color: ytColor, fontSize: 11, lineHeight: '16px',
+              cursor: 'pointer', whiteSpace: 'nowrap', fontFamily: 'inherit', textAlign: 'center',
+            },
+          }, ytLabel) : null,
           el('button', {
             type: 'button',
             title: sysProxyKnown

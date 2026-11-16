@@ -17,6 +17,8 @@ import { promises as fs, existsSync, readFileSync, rmSync } from 'node:fs';
 import { spawn, execFileSync } from 'node:child_process';
 import path from 'node:path';
 import net from 'node:net';
+import http from 'node:http';
+import tls from 'node:tls';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -28,6 +30,7 @@ const PID_FILE = path.join(DATA, 'mihomo.pid');
 const GEO_DATA_SRC = path.join(HERE, 'bin', 'geoip.metadb');
 const GEO_DATA_DST = path.join(DATA, 'geoip.metadb');
 const LAST_PICK = path.join(DATA, 'last-pick.json');
+const LAST_RESOLVE = path.join(DATA, 'last-resolve.json');
 const SETTINGS = path.join(HERE, 'proxy.json');
 
 const UA = 'clash-verge/v2.5.5';
@@ -38,12 +41,26 @@ const GROUP = '代理';
  * 各机场独有的差异（过滤策略）写在各自的 profile 里。
  *   zhuiyun —— 追云机场：yaml 块列表 - name: "新加坡 01【vip1】[A]"（原有行为，保持不变）
  *   kunlun  —— 昆仑云机场：flow 单行 - { name: '🇯🇵KL·日本|东京03', server: ... }
+ * 另有虚拟类型 auto（不在本表里）：解析时取各规则结果的并集（节点最全），
+ * 选节点时对最快的几个候选真实访问 YouTube 验证可达性，通过才采用；
+ * 验证结果记到 last-pick.json（verified），面板据此显示「YouTube 已验证」。
  */
 const AIRPORTS = {
-  zhuiyun: { label: '追云机场' },
-  kunlun: { label: '昆仑云机场' },
+  zhuiyun: { label: '追云机场', filter: (entries) => entries },
+  kunlun: {
+    label: '昆仑云机场',
+    // 昆仑云订阅里混着「📡 有异常请重启网络」这类没有地区名的提示节点：
+    // 偏好模式下永远选不到，只会污染节点列表，按机场类型滤掉。
+    filter: (entries) => entries.filter((entry) => regionOf(entry.name) !== ''),
+  },
 };
-const AIRPORT_DEFAULT = 'zhuiyun';
+const AUTO_AIRPORT = 'auto';
+const AUTO_LABEL = '自动（真实站验证）';
+
+/** 自动模式的真实可达验证：目标站与超时 */
+const VERIFY_TARGET = 'https://www.youtube.com/generate_204';
+const VERIFY_TIMEOUT = 6000;
+const VERIFY_CANDIDATES = 5;
 
 /** 地区词表：匹配时按长度倒序，保证「印度尼西亚」先于「印度」命中 */
 const REGION_WORDS = [
@@ -68,7 +85,7 @@ const DEFAULTS = {
   apiPort: 9099,
   secret: 'dsh-lqconfig',
   refreshMinutes: 360,
-  airport: AIRPORT_DEFAULT,
+  airport: AUTO_AIRPORT,
   warmupSeconds: 8,
 };
 
@@ -88,8 +105,7 @@ function normalize(value) {
     secret: typeof input.secret === 'string' && input.secret ? input.secret : DEFAULTS.secret,
     refreshMinutes: Number.isInteger(input.refreshMinutes) && input.refreshMinutes > 0
       ? input.refreshMinutes : DEFAULTS.refreshMinutes,
-    airport: typeof input.airport === 'string' && AIRPORTS[input.airport]
-      ? input.airport : DEFAULTS.airport,
+    airport: AUTO_AIRPORT,
     warmupSeconds: Number.isInteger(input.warmupSeconds) && input.warmupSeconds >= 0 && input.warmupSeconds <= 600
       ? input.warmupSeconds : DEFAULTS.warmupSeconds,
   };
@@ -253,9 +269,57 @@ export function commonRegions() {
   return [...COMMON_REGION_ORDER];
 }
 
-/** 面板「机场类型」下拉的数据源 */
+/** 面板「机场类型」下拉的数据源：机场解析规则已统一，只保留「自动」一项 */
 export function airportList() {
-  return Object.entries(AIRPORTS).map(([id, value]) => ({ id, label: value.label }));
+  return [{ id: AUTO_AIRPORT, label: AUTO_LABEL }];
+}
+
+/** 套用某条机场规则的过滤策略 */
+function applyAirportFilter(id, entries) {
+  const profile = AIRPORTS[id];
+  return profile ? profile.filter(entries) : entries;
+}
+
+/**
+ * 解析订阅文本并套用机场规则，返回 { entries, resolved }。
+ *   - 指定机场：只套该机场的过滤，resolved 就是它自己；
+ *   - 自动：对每条规则都解析一遍取并集（漏掉的提示节点由选节点阶段剔除），
+ *     真正决定「能不能用」的是选节点时的真实网站验证，resolved 固定为 'auto'。
+ */
+export function resolveEntries(text, airport) {
+  const base = parseProxyEntries(text).filter((entry) => !isInfoNode(entry.name));
+  if (airport !== AUTO_AIRPORT) {
+    return { entries: applyAirportFilter(airport, base), resolved: AIRPORTS[airport] ? airport : null };
+  }
+  const seen = new Set();
+  const entries = [];
+  for (const id of Object.keys(AIRPORTS)) {
+    for (const entry of applyAirportFilter(id, base)) {
+      if (seen.has(entry.name)) continue;
+      seen.add(entry.name);
+      entries.push(entry);
+    }
+  }
+  return { entries, resolved: AUTO_AIRPORT };
+}
+
+/** 上次解析命中的机场（自动模式显示用；指定机场时返回 null） */
+async function readResolvedAirport(airport) {
+  if (airport !== AUTO_AIRPORT) return null;
+  try {
+    const data = JSON.parse((await fs.readFile(LAST_RESOLVE, 'utf8')).replace(/^\uFEFF/, ''));
+    if (data && data.airport === airport && (data.resolved === AUTO_AIRPORT || AIRPORTS[data.resolved])) {
+      return data.resolved;
+    }
+  } catch { /* 还没有记录 */ }
+  return null;
+}
+
+async function writeResolvedAirport(airport, resolved) {
+  try {
+    await fs.mkdir(DATA, { recursive: true });
+    await fs.writeFile(LAST_RESOLVE, JSON.stringify({ airport, resolved, at: Date.now() }) + '\n', 'utf8');
+  } catch { /* 只是显示用，失败不影响代理 */ }
 }
 
 async function writeProvider(entries) {
@@ -277,21 +341,22 @@ export async function refreshProvider(settings, force) {
     const ageMinutes = (Date.now() - stat.mtimeMs) / 60000;
     if (ageMinutes < settings.refreshMinutes) {
       const cached = await readProvider();
-      if (cached.length > 0) return { refreshed: false, entries: cached };
+      if (cached.length > 0) {
+        return { refreshed: false, entries: cached, resolved: await readResolvedAirport(settings.airport) };
+      }
     }
   }
   const text = await fetchSubscription(settings.url);
-  let entries = parseProxyEntries(text).filter((entry) => !isInfoNode(entry.name));
-  // 昆仑云订阅里混着「📡 有异常请重启网络」这类没有地区名的提示节点：
-  // 偏好模式下永远选不到，只会污染节点列表，按机场类型滤掉。
-  if (settings.airport === 'kunlun') {
-    entries = entries.filter((entry) => regionOf(entry.name) !== '');
-  }
+  const { entries, resolved } = resolveEntries(text, settings.airport);
   if (entries.length === 0) {
-    throw new Error('订阅里没解析出节点，链接可能失效（机场类型可能选错了，可在面板切换后重试）');
+    const tried = settings.airport === AUTO_AIRPORT
+      ? '；自动模式已尝试全部机场规则'
+      : '';
+    throw new Error('订阅里没解析出节点，链接可能失效（机场类型可能选错了，可在面板切换后重试）' + tried);
   }
   await writeProvider(entries);
-  return { refreshed: true, entries };
+  await writeResolvedAirport(settings.airport, resolved);
+  return { refreshed: true, entries, resolved };
 }
 
 /* ---------------- 内核配置与进程 ---------------- */
@@ -459,6 +524,7 @@ export async function status() {
     proxy: 'http://127.0.0.1:' + settings.port,
     regions: settings.regions,
     airport: settings.airport,
+    airportResolved: await readResolvedAirport(settings.airport),
     refreshMinutes: settings.refreshMinutes,
     hasUrl: Boolean(settings.url),
     current,
@@ -507,17 +573,82 @@ async function triggerHealthCheck(settings) {
   } catch { /* 单点失败不影响后续读取 */ }
 }
 
-/** 把分组切到指定节点并记录，返回给调用方的简洁结果 */
-async function switchGroup(settings, best, region) {
+/** 把分组切到指定节点并记录，返回给调用方的简洁结果；extra 并入 last-pick（如验证标记） */
+async function switchGroup(settings, best, region, extra) {
   const response = await api(settings, '/proxies/' + encodeURIComponent(GROUP), {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ name: best.name }),
   });
   if (!response.ok) throw new Error('切换节点失败：HTTP ' + response.status);
-  const picked = { region: region || '全部', node: best.name, delay: best.delay, at: Date.now() };
+  const picked = { region: region || '全部', node: best.name, delay: best.delay, at: Date.now(), ...(extra || {}) };
   await writeLastPick(picked);
-  return { region: picked.region, node: picked.node, delay: picked.delay };
+  return { region: picked.region, node: picked.node, delay: picked.delay, ...(extra || {}) };
+}
+
+/**
+ * 通过本地代理访问目标 URL（CONNECT 隧道 + TLS），返回 HTTP 状态码；隧道/请求失败返回 0。
+ * 用于「自动」模式：不只看延迟，还真实验证节点能不能访问目标站。
+ */
+export function probeThroughProxy(port, targetUrl, timeoutMs) {
+  return new Promise((resolve) => {
+    const u = new URL(targetUrl);
+    const targetPort = u.port || 443;
+    let settled = false;
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      resolve(code);
+    };
+    const timer = setTimeout(() => finish(0), timeoutMs);
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      method: 'CONNECT',
+      path: u.hostname + ':' + targetPort,
+      timeout: timeoutMs,
+    });
+    req.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        clearTimeout(timer);
+        socket.destroy();
+        finish(0);
+        return;
+      }
+      const tlsSocket = tls.connect({ socket, servername: u.hostname, rejectUnauthorized: false }, () => {
+        tlsSocket.write([
+          'GET ' + (u.pathname || '/') + (u.search || '') + ' HTTP/1.1',
+          'Host: ' + u.hostname,
+          'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+          'Accept: */*',
+          'Connection: close',
+          '',
+          '',
+        ].join('\r\n'));
+      });
+      let head = '';
+      tlsSocket.on('data', (chunk) => {
+        head += chunk.toString('latin1');
+        const hit = head.match(/^HTTP\/1\.[01] (\d{3})/);
+        if (hit) {
+          clearTimeout(timer);
+          tlsSocket.destroy();
+          finish(Number(hit[1]));
+        }
+      });
+      tlsSocket.on('error', () => { clearTimeout(timer); finish(0); });
+      tlsSocket.on('close', () => { clearTimeout(timer); finish(0); });
+    });
+    req.on('error', () => { clearTimeout(timer); finish(0); });
+    req.on('timeout', () => { clearTimeout(timer); req.destroy(); finish(0); });
+    req.end();
+  });
+}
+
+/** 自动模式：当前节点真实访问目标站，2xx/3xx 视为通过 */
+async function verifyThroughProxy(settings) {
+  const code = await probeThroughProxy(settings.port, VERIFY_TARGET, VERIFY_TIMEOUT);
+  return code >= 200 && code < 400;
 }
 
 export async function pickAndSwitch(settingsOverride) {
@@ -539,19 +670,37 @@ export async function pickAndSwitch(settingsOverride) {
   const usable = nodes.filter((node) => node.alive && typeof node.delay === 'number' && node.delay > 0);
   if (usable.length === 0) throw new Error('健康检查后没有可用节点');
 
+  /** 按偏好地区分桶：地区优先，桶内按延迟升序；偏好地区全无节点时回退全部节点 */
+  const buckets = [];
   for (const region of order) {
     const pool = region ? usable.filter((node) => regionOf(node.name) === region) : usable;
     if (pool.length === 0) continue;
-    pool.sort((a, b) => a.delay - b.delay);
+    buckets.push({ region, pool: [...pool].sort((a, b) => a.delay - b.delay) });
+  }
+  if (settings.regions.length > 0 && buckets.length === 0) {
+    buckets.push({ region: null, pool: [...usable].sort((a, b) => a.delay - b.delay) });
+  }
+  if (buckets.length === 0) throw new Error('健康检查后没有可用节点');
+
+  if (settings.airport !== AUTO_AIRPORT) {
+    const { region, pool } = buckets[0];
     return await switchGroup(settings, pool[0], region);
   }
 
-  // 偏好是软约束：机场里没有偏好地区（或全挂）时，回退到全部节点里挑最低延迟
-  if (settings.regions.length > 0) {
-    const pool = [...usable].sort((a, b) => a.delay - b.delay);
-    return await switchGroup(settings, pool[0], null);
+  // 自动模式：地区/延迟排序后，对最快的几个候选逐个真实访问目标站，第一个能通的就用
+  for (const { region, pool } of buckets) {
+    for (const candidate of pool.slice(0, VERIFY_CANDIDATES)) {
+      await switchGroup(settings, candidate, region, { verified: false });
+      if (await verifyThroughProxy(settings)) {
+        const picked = await switchGroup(settings, candidate, region, { verified: true, verifyTarget: VERIFY_TARGET });
+        return { ...picked, verified: true, verifyTarget: VERIFY_TARGET };
+      }
+    }
   }
-  throw new Error('健康检查后没有可用节点');
+  // 所有候选都没通过真实站验证：退回延迟选法，保证代理仍可用
+  const { region, pool } = buckets[0];
+  const fallback = await switchGroup(settings, pool[0], region, { verified: false, verifyFallback: true });
+  return { ...fallback, verified: false, verifyFallback: true, verifyTarget: VERIFY_TARGET };
 }
 
 /** 把仓库里的 GeoIP 数据同步到内核工作目录（-d），GEOIP 规则才能生效 */
