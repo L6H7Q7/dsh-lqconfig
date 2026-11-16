@@ -396,7 +396,7 @@ function configYaml(settings) {
     '    path: ./providers/zhuiyun.yaml',
     '    health-check:',
     '      enable: true',
-    '      url: http://www.gstatic.com/generate_204',
+    '      url: https://www.youtube.com/generate_204',
     '      interval: 300',
     'proxy-groups:',
     "  - name: '" + GROUP + "'",
@@ -553,7 +553,8 @@ export async function listRegions(settingsOverride) {
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, 'zh'));
 }
 
-const DELAY_TARGET = 'http://www.gstatic.com/generate_204';
+/** 健康检查与选节点验证统一瞄准 YouTube：只有 YouTube 可达的节点才算可用 */
+const DELAY_TARGET = 'https://www.youtube.com/generate_204';
 
 /** provider 内节点不在 /proxies 字典里，只能从 /providers/proxies 读 alive 与 history 延迟 */
 async function providerNodes(settings) {
@@ -569,7 +570,7 @@ async function providerNodes(settings) {
 
 async function triggerHealthCheck(settings) {
   try {
-    await api(settings, '/providers/proxies/zhuiyun/healthcheck?url=' + encodeURIComponent(DELAY_TARGET) + '&timeout=4000');
+    await api(settings, '/providers/proxies/zhuiyun/healthcheck?url=' + encodeURIComponent(DELAY_TARGET) + '&timeout=6000');
   } catch { /* 单点失败不影响后续读取 */ }
 }
 
@@ -645,10 +646,11 @@ export function probeThroughProxy(port, targetUrl, timeoutMs) {
   });
 }
 
-/** 自动模式：当前节点真实访问目标站，2xx/3xx 视为通过 */
+/** 自动模式：当前节点完整访问一次目标站，返回 { ok, elapsed }（毫秒，含 CONNECT+TLS+请求） */
 async function verifyThroughProxy(settings) {
+  const started = Date.now();
   const code = await probeThroughProxy(settings.port, VERIFY_TARGET, VERIFY_TIMEOUT);
-  return code >= 200 && code < 400;
+  return { ok: code >= 200 && code < 400, elapsed: Date.now() - started };
 }
 
 export async function pickAndSwitch(settingsOverride) {
@@ -687,14 +689,22 @@ export async function pickAndSwitch(settingsOverride) {
     return await switchGroup(settings, pool[0], region);
   }
 
-  // 自动模式：地区/延迟排序后，对最快的几个候选逐个真实访问目标站，第一个能通的就用
+  // 自动模式：按地区优先级，对最快 5 个候选完整测一次 YouTube，
+  // 选「通且完整请求耗时最低」的；某桶全不通再试下一个桶
   for (const { region, pool } of buckets) {
+    let best = null;
     for (const candidate of pool.slice(0, VERIFY_CANDIDATES)) {
       await switchGroup(settings, candidate, region, { verified: false });
-      if (await verifyThroughProxy(settings)) {
-        const picked = await switchGroup(settings, candidate, region, { verified: true, verifyTarget: VERIFY_TARGET });
-        return { ...picked, verified: true, verifyTarget: VERIFY_TARGET };
+      const probe = await verifyThroughProxy(settings);
+      if (probe.ok && (!best || probe.elapsed < best.elapsed)) {
+        best = { candidate, elapsed: probe.elapsed };
       }
+    }
+    if (best) {
+      const picked = await switchGroup(settings, best.candidate, region, {
+        verified: true, verifyTarget: VERIFY_TARGET, verifyMs: best.elapsed,
+      });
+      return { ...picked, verified: true, verifyTarget: VERIFY_TARGET, verifyMs: best.elapsed };
     }
   }
   // 所有候选都没通过真实站验证：退回延迟选法，保证代理仍可用

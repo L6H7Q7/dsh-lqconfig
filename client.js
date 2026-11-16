@@ -2088,10 +2088,10 @@ window.__ModuleLoader__.load({
         : !ytDelay.running ? '—'
           : ytDelay.ok && ytDelay.delay ? ytDelay.delay + 'ms'
             : '网络错误';
-      // 延迟分级：≤150ms 绿、≤300ms 黄、更慢或失败 红
+      // 延迟分级：≤400ms 绿、≤1000ms 黄、更慢或失败 红
       const ytColor = ytDelay.loading || !ytDelay.running ? 'rgba(128,128,128,0.6)'
         : ytDelay.ok && ytDelay.delay
-          ? (ytDelay.delay <= 150 ? '#1e8449' : ytDelay.delay <= 300 ? '#c28b30' : '#c0392b')
+          ? (ytDelay.delay <= 400 ? '#1e8449' : ytDelay.delay <= 1000 ? '#c28b30' : '#c0392b')
           : '#c0392b';
       const detail = '代理：' + label
         + (state && state.delay ? '（' + state.delay + 'ms）' : '')
